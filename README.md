@@ -89,5 +89,3 @@ A powerful multi-threaded SMB-share explorer & credential/secret discovery tool.
 Use only in environments where you have explicit authorization. The author is not responsible for misuse.
 
 ---
-
-If you like — I can also generate a screenshot example or template usage to include in the repo.
