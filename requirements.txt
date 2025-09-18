@@ -1,0 +1,4 @@
+impacket
+tqdm
+olefile
+PyPDF2
