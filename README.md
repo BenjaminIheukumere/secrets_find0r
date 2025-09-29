@@ -54,6 +54,11 @@ A powerful multi-threaded SMB-share explorer & credential/secret discovery tool.
 
 ---
 
+## Screenshot of Secrets Find0r in action
+![Secrets Find0r in action](secrets_find0r_scanning.png)
+
+---
+
 ## Output
 
 * Console output: aligned ASCII table, matched tokens highlighted with red background
@@ -64,6 +69,7 @@ A powerful multi-threaded SMB-share explorer & credential/secret discovery tool.
   userX_secrets_found_20250917_123456.txt
   ```
 * Contents: columns: `Host | Share | Path | Match`
+![Secrets Find0r in Demo-Output](secrets_find0r_output.png)
 
 ---
 
