@@ -45,10 +45,18 @@ THREADS_ENUM = 32                  # workers for host/share/file enumeration
 THREADS_FILES = 8                  # workers for file download/scan (keep modest to avoid many sockets)
 MAX_FILE_BYTES = 4 * 1024 * 1024   # max bytes to download per file
 MAX_UNKNOWN_BYTES = 256 * 1024     # cap for unknown/no-extension files if included
-MAX_DIR_DEPTH = 2                 # max directory depth (root '\' = 0); None = unlimited
+MAX_DIR_DEPTH = 2                  # max directory depth (root '\' = 0); None = unlimited
 PORT_PROBE_TIMEOUT = 0.5           # TCP connect timeout for port 445
 SMB_CONNECT_TIMEOUT = 5            # SMBConnection connect timeout
 SMB_OP_TIMEOUT = 5                 # SMB operation timeout
+
+# Exclude default/admin shares (configurable)
+EXCLUDE_SHARES = {
+    'ADMIN$', 'IPC$', 'PRINT$', 'FAX$',  # service shares
+    #'SYSVOL', 'NETLOGON',                # AD system shares
+}
+# Regex for admin drive shares like C$, D$, E$, ...
+EXCLUDE_SHARE_REGEX = re.compile(r'^[A-Z]\$$')
 
 KEYWORDS = [
     "password", "passwort", "passwd", "secret", "apikey", "api_key",
@@ -62,7 +70,7 @@ REGEX_PATTERNS = [
     re.compile(rb'([Uu]sername|[Uu]ser)\s*[:=]\s*([^\s,;\'"]+)', re.I),
     re.compile(rb'([Uu]id|[Uu]serid)\s*[:=]\s*([^\s,;\'"]+)', re.I),
     re.compile(rb'(password|passwd)\s*=\s*[^;\'"]+', re.I),
-    #re.compile(rb'([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})')
+    # re.compile(rb'([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})')
 ]
 
 # Supported extensions (extended)
@@ -327,6 +335,17 @@ def _new_conn(host, username, password):
         conn.login('', '')
     return conn
 
+def share_is_excluded(name: str) -> bool:
+    """Return True if share name should be excluded (admin/system shares)."""
+    if not name:
+        return True
+    up = name.upper()
+    if up in EXCLUDE_SHARES:
+        return True
+    if EXCLUDE_SHARE_REGEX.match(up):   # C$, D$, E$, ...
+        return True
+    return False
+
 def download_file_smb_by_conn(host, username, password, share, path, max_bytes=MAX_FILE_BYTES) -> bytes:
     """Download up to max_bytes from a file via a fresh SMB connection (always closed)."""
     buf = io.BytesIO()
@@ -386,7 +405,7 @@ def enumerate_files_on_host(host, username, password, keywords_lower, include_un
                 name = None
             if not name:
                 continue
-            if name.upper() in ('NETLOGON', 'SYSVOL'):
+            if share_is_excluded(name):
                 continue
             shares.append(name)
     except Exception:
@@ -723,7 +742,7 @@ def main():
     with ThreadPoolExecutor(max_workers=min(THREADS_ENUM, max(4, len(hosts)))) as ex:
         futures = {ex.submit(enumerate_files_on_host, host, username, password, keywords_lower, include_unknown): host
                    for host in hosts}
-        for fut in tqdm(as_completed(futures), total=len(futures), desc="Enumerating shares", unit="host"):
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="Enumerating shares (that'll take a while)", unit="host"):
             try:
                 tasks = fut.result()
                 if tasks:
