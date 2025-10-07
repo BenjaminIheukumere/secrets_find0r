@@ -8,10 +8,16 @@ A powerful multi-threaded SMB-share explorer & credential/secret discovery tool.
 
 * Recursive SMB share scanning with depth limit (configurable)
 * File type filtering & keyword + regex-based secret detection (supports text, Office documents, PDFs, unknown/no-extension with name hints)
-* Token-level highlighting in console, plain ASCII export to file
 * Multithreading: separate pools for enumeration and file scanning
 * Proper closing of connections to avoid resource leaks
 * Configurable parameters: threads, timeouts, max directory depth
+* Auth Modes:** NTLM (password or NT hash) & **Kerberos** (kinit cache or password/hash)
+* Admin share exclusions** by default (`ADMIN$`, `IPC$`, drive shares like `C$`, …)
+* Token-level highlighting** on screen (only the matched word/phrase is colored)
+* File formats:** txt/csv/json/html/eml/rtf/log/xml/yaml/ps1, **docx/xlsx/pptx**, **doc/xls/ppt (OLE)**, **PDF**
+* Multithreaded** enumeration & scanning, **configurable** performance knobs
+* Depth-limited recursion** to avoid massive traversals
+* Plain ASCII report** saved to `USERNAME_secrets_found_YYYYMMDD_HHMMSS.txt`
 
 ---
 
@@ -38,19 +44,55 @@ A powerful multi-threaded SMB-share explorer & credential/secret discovery tool.
 ---
 
 ## Usage
+You can run **interactively** (prompts) or **fully by CLI** (scriptable). Missing values are prompted interactively; performance defaults are used unless overridden.
 
+### Interactive
+```bash
+python secrets_find0r.py
 ```
-./secrets_find0r.py
+You’ll be asked for:
+- Username (empty = anonymous)
+- **Authentication**: NTLM or Kerberos  
+  - Kerberos: provide **DOMAIN** and **KDC/DC FQDN** (must resolve or be in `/etc/hosts`).  
+    The supplied DC **FQDN is auto-used as SPN** target (`cifs/<FQDN>`).
+- CIDR to scan (e.g., `192.168.1.0/24`)
+- Include unknown/no-ext files if names look sensitive? (Y/n)
+- Use default keyword list or provide your own
+
+### CLI (all options)
+
+**Auth & identity**
+```
+--cidr CIDR
+--username USER
+--password PASS
+--hash NTHASH                 # 32 hex chars; LM not required
+--domain DOMAIN               # required for Kerberos
+--kerberos                    # enable Kerberos (instead of NTLM)
+--kdc FQDN                    # KDC/DC FQDN (resolvable or in /etc/hosts); also used as SPN cifs/<FQDN>
+--use-cache                   # use Kerberos ticket cache (kinit)
 ```
 
-* On start it will prompt for:
-  – Username (leave blank for anonymous)
-  – Password (if username entered)
-  – CIDR to scan (e.g. `192.168.1.0/24`)
-  – Whether to include unknown or no-extension files
-  – Optionally custom keywords
-* The script will enumerate accessible shares, then scan candidate files, showing a progress bar
-* Results are shown onscreen in a colored, aligned table, and saved to a file prefixed with the username (or `anon_`)
+**Keywords & candidate selection**
+```
+--include-unknown             # include unknown/no-ext files if name looks sensitive
+--no-default-keywords         # do not load built-in keyword list
+--keywords "k1,k2,..."        # custom list; merged unless --no-default-keywords
+```
+
+**Performance & limits**
+```
+--threads-enum INT            # default 32
+--threads-files INT           # default 8
+--max-file-bytes INT          # default 4194304 (4 MiB)
+--max-unknown-bytes INT       # default 262144 (256 KiB)
+--max-dir-depth INT           # default 2 (root '\' = 0)
+--port-probe-timeout FLOAT    # default 0.5
+--smb-connect-timeout FLOAT   # default 5
+--smb-op-timeout FLOAT        # default 5
+```
+
+> **Note (Kerberos):** `--kdc` must be a **FQDN** and resolvable. The same value is used as SPN target. Consider `kinit user@REALM` + `--use-cache` for smoother auth.
 
 ---
 
@@ -59,7 +101,95 @@ A powerful multi-threaded SMB-share explorer & credential/secret discovery tool.
 
 ---
 
-## Output
+## 📚 Examples
+
+**NTLM (password)**
+```bash
+python secrets_find0r.py \
+  --cidr 10.10.20.0/24 \
+  --username corp\\j.doe \
+  --password 'S3cr3t!' \
+  --threads-enum 64 --threads-files 12 \
+  --max-dir-depth 3
+```
+
+**NTLM (NT hash)**
+```bash
+python secrets_find0r.py \
+  --cidr 10.0.0.0/23 \
+  --username CORP\\svc.scan \
+  --hash 5f4dcc3b5aa765d61d8327deb882cf99
+```
+
+**Kerberos (using kinit cache)**
+```bash
+kinit user@CORP.LOCAL
+python secrets_find0r.py \
+  --cidr 192.168.56.0/24 \
+  --kerberos --use-cache \
+  --domain CORP.LOCAL \
+  --kdc dc01.corp.local
+```
+
+**Kerberos (with password)**
+```bash
+python secrets_find0r.py \
+  --cidr 172.16.1.0/24 \
+  --kerberos \
+  --domain CORP.LOCAL \
+  --kdc dc01.corp.local \
+  --username user.name \
+  --password 'CorrectHorseBatteryStaple'
+```
+
+**Include unknown/no-ext & custom keywords (merge with defaults)**
+```bash
+python secrets_find0r.py \
+  --cidr 10.1.2.0/24 \
+  --username corp\\auditor \
+  --password 'Audit-2025!' \
+  --include-unknown \
+  --keywords "client_secret,oauth,token,privatekey"
+```
+
+**Only custom keywords**
+```bash
+python secrets_find0r.py \
+  --cidr 10.2.3.0/24 \
+  --username corp\\redteam \
+  --password 'Xx!xX' \
+  --no-default-keywords \
+  --keywords "db_password,sa_password,connectionstring"
+```
+
+**Tune performance/timeouts**
+```bash
+python secrets_find0r.py \
+  --cidr 192.168.100.0/24 \
+  --username corp\\ops \
+  --password 'ops!' \
+  --threads-enum 96 --threads-files 16 \
+  --port-probe-timeout 0.3 \
+  --smb-connect-timeout 8 \
+  --smb-op-timeout 8 \
+  --max-file-bytes 6291456 \
+  --max-dir-depth 4
+```
+
+---
+
+## 🧪 Output
+
+- **Screen:** ANSI-colored table — only the matched tokens are highlighted (red background).  
+- **File:** Plain ASCII table (no ANSI), saved to e.g. `user_secrets_found_YYYYMMDD_HHMMSS.txt`.
+
+Sample (screen):
+```
++-----------------+-----------+-------------------------------------------+-------------------------------+
+| Host            | Share     | Path                                      | Match                         |
++-----------------+-----------+-------------------------------------------+-------------------------------+
+| 192.168.1.23    | Finance   | \budgets\2025\costs.txt                   | ... db=prod; user=sa; pass=██ |
++-----------------+-----------+-------------------------------------------+-------------------------------+
 
 * Console output: aligned ASCII table, matched tokens highlighted with red background
 * File output: plain ASCII table, no color codes
@@ -79,6 +209,13 @@ A powerful multi-threaded SMB-share explorer & credential/secret discovery tool.
 * Deep directory trees may be large; `MAX_DIR_DEPTH` setting helps prevent runaway recursion.
 * Large files truncated by `MAX_FILE_BYTES` setting
 * Parser availability (PDF, legacy Office) depends on installed optional libraries (`PyPDF2`, `olefile`)
+* Exclusions:** Admin/system shares are skipped by default (`ADMIN$`, `IPC$`, drive shares like `C$`, `D$`, ...).  
+* Kerberos `KDC_ERR_S_PRINCIPAL_UNKNOWN`:** Usually the target SPN isn’t found. Verify:
+* FQDN** correctness & DNS/hosts resolution
+* Domain/realm** matches
+  - The **SPN exists** on the target (e.g., `setspn -Q cifs/server.domain.tld`)
+  - Try `kinit user@REALM` and run with `--use-cache`
+* Depth:** `--max-dir-depth` controls recursion (root `\` = 0). Increase if needed, but expect more files.
 
 ---
 
@@ -89,6 +226,18 @@ A powerful multi-threaded SMB-share explorer & credential/secret discovery tool.
 * To add new keywords or extensions: edit `KEYWORDS`, `SUPPORTED_EXTS`, `REGEX_PATTERNS`
 
 ---
+
+## 📦 Requirements
+
+- Python **3.8+**
+- Required: `impacket`, `tqdm`
+- Optional (recommended): `olefile`, `PyPDF2`
+
+Install quickly (recommended virtual env):
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
 
 ## Disclaimer
 
