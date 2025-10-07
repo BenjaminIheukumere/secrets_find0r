@@ -194,7 +194,7 @@ Sample (screen):
 * Console output: aligned ASCII table, matched tokens highlighted with red background
 * File output: plain ASCII table, no color codes
 * Example filename:
-
+```
   ```
   userX_secrets_found_20250917_123456.txt
   ```
