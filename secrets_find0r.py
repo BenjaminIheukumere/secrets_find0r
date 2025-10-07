@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Secrets Find0r (token-level highlight)
-- Only the matched token inside the context is highlighted (red background) on screen
-- File export is a plain ASCII table without ANSI colors
-- Robust SMB enumeration (UNC '\\*', visited-set, timeouts, port check)
-- Optional inclusion of unknown/no-extension files with size cap
-- Legacy Office parsing via olefile, PDF via PyPDF2 (optional)
+Secrets Find0r (token-level highlight) with robust Kerberos/NTLM auth
+- Token-only highlight with red background on matches (screen)
+- Plain ASCII table (no colors) for file output
+- Exclude admin shares (ADMIN$, IPC$, PRINT$, [A-Z]$)
+- Robust SMB enumeration with recursion depth limit
+- Optional include of unknown/no-extension files when names look sensitive
+- Legacy Office via olefile; PDF via PyPDF2
 - Multithreaded, progress bars, customizable keywords
-- Configurable maximum directory depth to avoid extremely deep recursion
-- FIX: Properly close SMB sockets and limit concurrent file scans to avoid 'Too many open files'
+- Kerberos or NTLM auth; NTLM supports LM:NT or NT-only hashes
+- SPN control via --target-name (e.g. filesrv01.contoso.local)
+- Interactive and CLI modes; Kerberos auth test + error loop in interactive
 """
 
 import os
@@ -21,6 +23,7 @@ import socket
 import ipaddress
 import getpass
 import shutil
+import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
@@ -40,7 +43,7 @@ try:
 except Exception:
     HAS_OLEFILE = False
 
-# ---------- Configurable params ----------
+# ---------- Configurable params (defaults; can be overridden by CLI) ----------
 THREADS_ENUM = 32                  # workers for host/share/file enumeration
 THREADS_FILES = 8                  # workers for file download/scan (keep modest to avoid many sockets)
 MAX_FILE_BYTES = 4 * 1024 * 1024   # max bytes to download per file
@@ -52,13 +55,12 @@ SMB_OP_TIMEOUT = 5                 # SMB operation timeout
 
 # Exclude default/admin shares (configurable)
 EXCLUDE_SHARES = {
-    'ADMIN$', 'IPC$', 'PRINT$', 'FAX$',  # service shares
-    #'SYSVOL', 'NETLOGON',                # AD system shares
+    'ADMIN$', 'IPC$', 'PRINT$', 'FAX$',
+    # 'SYSVOL', 'NETLOGON',  # re-enable exclusion if desired
 }
-# Regex for admin drive shares like C$, D$, E$, ...
-EXCLUDE_SHARE_REGEX = re.compile(r'^[A-Z]\$$')
+EXCLUDE_SHARE_REGEX = re.compile(r'^[A-Z]\$$')  # C$, D$, E$, ...
 
-KEYWORDS = [
+KEYWORDS_DEFAULT = [
     "password", "passwort", "passwd", "secret", "apikey", "api_key",
     "token", "connectionstring", "connection_string", "dbpassword", "db_pass",
     "username", "userid", "user", "credential", "creds", "secrets", "keyvault"
@@ -70,7 +72,6 @@ REGEX_PATTERNS = [
     re.compile(rb'([Uu]sername|[Uu]ser)\s*[:=]\s*([^\s,;\'"]+)', re.I),
     re.compile(rb'([Uu]id|[Uu]serid)\s*[:=]\s*([^\s,;\'"]+)', re.I),
     re.compile(rb'(password|passwd)\s*=\s*[^;\'"]+', re.I),
-    # re.compile(rb'([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})')
 ]
 
 # Supported extensions (extended)
@@ -121,14 +122,18 @@ BANNER = r"""
                                                                            
 """
 imprint = r"""
-                  Secrets Find0r v1.0
+                  Secrets Find0r v1.1
            by Benjamin Iheukumere | SafeLink IT
                b.iheukumere@safelink-it.com
 """
 
 ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+ANSI_RE_FULL = re.compile(r'\x1b\[[0-9;]*m')
 
 # ---------- Utilities ----------
+def clear_screen():
+    os.system('clear' if os.name == 'posix' else 'cls')
+
 def to_text(b: bytes):
     """Decode bytes to text using common fallbacks."""
     for enc in ('utf-8', 'latin-1', 'cp1252'):
@@ -157,6 +162,51 @@ def strip_ansi(s: str) -> str:
 def visible_len(s: str) -> int:
     """Compute string length without ANSI escape codes (for table layout)."""
     return len(strip_ansi(s))
+
+def parse_ntlm_hash(s: str):
+    """
+    Parse NTLM hash input. Accepts:
+      - NT only: 32 hex chars
+      - LM:NT   : "LMHASH:NTHASH" (each 32 hex; LM may be 32 zeros)
+    Returns (lmhash, nthash) or (None, None) if invalid.
+    """
+    if not s:
+        return (None, None)
+    s = s.strip()
+    if ':' in s:
+        lm, nt = s.split(':', 1)
+        lm = lm.strip()
+        nt = nt.strip()
+        if re.fullmatch(r'[0-9a-fA-F]{32}', lm) and re.fullmatch(r'[0-9a-fA-F]{32}', nt):
+            return (lm, nt)
+        return (None, None)
+    else:
+        # NT only
+        if re.fullmatch(r'[0-9a-fA-F]{32}', s):
+            return ('0' * 32, s)
+        return (None, None)
+
+def first_network_host_str(network):
+    """
+    Return the first usable host in the network as a string, or None.
+    Works even if `network.hosts()` returns a list or if `network` is already a list of IPs.
+    """
+    try:
+        if hasattr(network, "hosts") and callable(network.hosts):
+            it = network.hosts()
+            try:
+                h = next(it)
+                return str(h)
+            except TypeError:
+                hosts_list = list(network.hosts())
+                return str(hosts_list[0]) if hosts_list else None
+            except StopIteration:
+                return None
+        if isinstance(network, (list, tuple)) and network:
+            return str(network[0])
+    except Exception:
+        pass
+    return None
 
 # ----- Highlight helpers -----
 def make_snippet_with_highlights(text: str, start_idx: int, end_idx: int, terms):
@@ -318,23 +368,6 @@ def _is_dir_entry(e):
     except Exception:
         return False
 
-def _new_conn(host, username, password):
-    """Create and login an SMBConnection with configured timeouts."""
-    conn = SMBConnection(host, host, sess_port=445, timeout=SMB_CONNECT_TIMEOUT)
-    try:
-        conn.setTimeout(SMB_OP_TIMEOUT)
-    except Exception:
-        pass
-    if username:
-        if "\\" in username:
-            domain, user = username.split("\\", 1)
-        else:
-            domain, user = '', username
-        conn.login(user, password, domain)
-    else:
-        conn.login('', '')
-    return conn
-
 def share_is_excluded(name: str) -> bool:
     """Return True if share name should be excluded (admin/system shares)."""
     if not name:
@@ -346,13 +379,99 @@ def share_is_excluded(name: str) -> bool:
         return True
     return False
 
-def download_file_smb_by_conn(host, username, password, share, path, max_bytes=MAX_FILE_BYTES) -> bytes:
+def build_remote_name(host: str, target_name: str | None, kerberos: bool) -> str:
+    """
+    Decide the 'remoteName' argument for SMBConnection:
+    - If target_name provided, use it.
+    - Else for Kerberos, prefer FQDN (helps SPN cifs/fqdn).
+    - Else fall back to host.
+    """
+    if target_name:
+        return target_name
+    if kerberos:
+        try:
+            fqdn = socket.getfqdn(host)
+            if fqdn and fqdn != host and '.' in fqdn:
+                return fqdn
+        except Exception:
+            pass
+    return host
+
+def new_conn(host, auth):
+    """
+    Create and login an SMBConnection with configured timeouts.
+    Supports NTLM and Kerberos. Returns (conn, error_msg) where error_msg is None on success.
+    """
+    kerberos = (auth.get('mode') == 'kerberos')
+    remote_name = build_remote_name(host, auth.get('target_name'), kerberos)
+
+    conn = SMBConnection(remote_name, host, sess_port=445, timeout=auth.get('smb_connect_timeout', SMB_CONNECT_TIMEOUT))
+    try:
+        conn.setTimeout(auth.get('smb_op_timeout', SMB_OP_TIMEOUT))
+    except Exception:
+        pass
+
+    user = auth.get('username') or ''
+    domain = auth.get('domain') or ''
+    password = auth.get('password') or ''
+    lmhash = auth.get('lmhash') or ''
+    nthash = auth.get('nthash') or ''
+    kdc = auth.get('kdc')
+    use_cache = bool(auth.get('use_cache', False))
+
+    try:
+        if kerberos:
+            conn.kerberosLogin(user, password, domain,
+                               lmhash, nthash,
+                               aesKey='',
+                               TGT=None, TGS=None,
+                               useCache=use_cache,
+                               kdcHost=kdc)
+        else:
+            if nthash and len(nthash) == 32:
+                conn.login(user, '', domain, lmhash=lmhash, nthash=nthash)
+            else:
+                conn.login(user, password, domain)
+        return conn, None
+    except Exception as e:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return None, str(e)
+
+def test_kerberos(auth, test_host):
+    """
+    Try a short Kerberos session to validate KDC/domain/target-name combo.
+    Returns (True, None) on success, else (False, reason).
+    """
+    conn, err = new_conn(test_host, auth)
+    if err or not conn:
+        return False, f"{err}"
+    try:
+        conn.listShares()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+    finally:
+        try:
+            conn.logoff()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+def download_file_smb_by_conn(host, auth, share, path, max_bytes=MAX_FILE_BYTES) -> bytes:
     """Download up to max_bytes from a file via a fresh SMB connection (always closed)."""
     buf = io.BytesIO()
     got = 0
     conn = None
     try:
-        conn = _new_conn(host, username, password)
+        conn, err = new_conn(host, auth)
+        if err or not conn:
+            return b''
         def callback(data):
             nonlocal got
             if not data:
@@ -379,16 +498,14 @@ def download_file_smb_by_conn(host, username, password, share, path, max_bytes=M
                 pass
     return buf.getvalue()
 
-def enumerate_files_on_host(host, username, password, keywords_lower, include_unknown=True):
+def enumerate_files_on_host(host, auth, keywords_lower, include_unknown=True):
     """Enumerate interesting files on all accessible shares of a host, honoring MAX_DIR_DEPTH."""
     tasks = []
-    if not port_open(host, 445, timeout=PORT_PROBE_TIMEOUT):
+    if not port_open(host, 445, timeout=auth.get('port_probe_timeout', PORT_PROBE_TIMEOUT)):
         return tasks
 
-    conn = None
-    try:
-        conn = _new_conn(host, username, password)
-    except Exception:
+    conn, err = new_conn(host, auth)
+    if err or not conn:
         return tasks
 
     # List shares
@@ -403,9 +520,7 @@ def enumerate_files_on_host(host, username, password, keywords_lower, include_un
                     name = raw[:-1] if isinstance(raw, str) and raw.endswith('\x00') else raw
             except Exception:
                 name = None
-            if not name:
-                continue
-            if share_is_excluded(name):
+            if not name or share_is_excluded(name):
                 continue
             shares.append(name)
     except Exception:
@@ -423,7 +538,6 @@ def enumerate_files_on_host(host, username, password, keywords_lower, include_un
                     continue
                 visited.add(key)
 
-                # Build pattern and normalized current dir
                 if cur in ('\\', ''):
                     pattern = '\\*'
                     current_dir = '\\'
@@ -438,7 +552,6 @@ def enumerate_files_on_host(host, username, password, keywords_lower, include_un
                     continue
 
                 for e in entries:
-                    # Obtain name robustly
                     fname = None
                     for getter in ('get_longname', 'getFileName', 'get_shortname'):
                         try:
@@ -450,23 +563,20 @@ def enumerate_files_on_host(host, username, password, keywords_lower, include_un
                     if not fname or fname in ('.', '..'):
                         continue
 
-                    # Full path within the share
                     if current_dir in ('\\', ''):
                         full = '\\' + fname
                     else:
                         full = current_dir.rstrip('\\') + '\\' + fname
 
-                    # Directory?
                     if _is_dir_entry(e):
-                        # Enforce max directory depth if configured
-                        if MAX_DIR_DEPTH is not None:
+                        max_depth = auth.get('max_dir_depth', MAX_DIR_DEPTH)
+                        if max_depth is not None:
                             depth = full.count('\\') - 1  # root '\' -> 0
-                            if depth > MAX_DIR_DEPTH:
+                            if depth > max_depth:
                                 continue
                         stack.append(full)
                         continue
 
-                    # File filter
                     name_l = fname.lower()
                     ext = os.path.splitext(name_l)[1]
                     interesting_name = any(kw in name_l for kw in ["pass", "pwd", "secret", "cred", "token", "key"])
@@ -474,35 +584,35 @@ def enumerate_files_on_host(host, username, password, keywords_lower, include_un
                         tasks.append((host, share, full))
                     elif include_unknown and (ext == "" or ext not in SUPPORTED_EXTS):
                         if interesting_name:
-                            tasks.append((host, share, full + f"|unknown<{MAX_UNKNOWN_BYTES}>"))
+                            cap = auth.get('max_unknown_bytes', MAX_UNKNOWN_BYTES)
+                            tasks.append((host, share, full + f"|unknown<{cap}>"))
     finally:
-        if conn:
-            try:
-                conn.logoff()
-            except Exception:
-                pass
-            try:
-                conn.close()
-            except Exception:
-                pass
+        try:
+            conn.logoff()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
 
     return tasks
 
 # ---------- File processing ----------
-def process_file_task_reconnect(task, username, password, keywords_lower):
+def process_file_task_reconnect(task, auth, keywords_lower):
     """Reconnect for each file, download (capped), extract text, and scan for matches."""
     host, share, filepath = task
-    limit = MAX_FILE_BYTES
+    limit = auth.get('max_file_bytes', MAX_FILE_BYTES)
     if "|unknown<" in filepath:
         path_only, marker = filepath.split("|unknown<", 1)
         filepath = path_only
         try:
             limit = min(limit, int(marker.rstrip(">").strip()))
         except Exception:
-            limit = min(limit, MAX_UNKNOWN_BYTES)
+            limit = min(limit, auth.get('max_unknown_bytes', MAX_UNKNOWN_BYTES))
 
     try:
-        b = download_file_smb_by_conn(host, username, password, share, filepath, max_bytes=limit)
+        b = download_file_smb_by_conn(host, auth, share, filepath, max_bytes=limit)
         if not b:
             return None
         ext = file_ext(filepath)
@@ -536,7 +646,6 @@ def process_file_task_reconnect(task, username, password, keywords_lower):
             matches.extend(scan_bytes_for_patterns(b, keywords_lower))
 
         if matches:
-            # Unique preserve order
             seen = set(); uniq = []
             for m in matches:
                 if m not in seen:
@@ -554,43 +663,32 @@ def wrap_ansi_lines(s: str, width: int):
     s = s or ""
     out = []
     line = []
-    vis = 0
-    i = 0
     last_space_idx = -1
+    i = 0
     while i < len(s):
-        # ANSI sequence?
         if s[i] == '\x1b':
-            m = ANSI_RE.match(s, i)
+            m = ANSI_RE_FULL.match(s, i)
             if m:
                 line.append(m.group(0))
                 i = m.end()
                 continue
-        ch = s[i]
-        i += 1
+        ch = s[i]; i += 1
         line.append(ch)
         if ch == ' ':
             last_space_idx = len(line) - 1
-        # count visible
-        vis += 0 if ch == '\x1b' else 1
-        # wrap when exceeding width
+        vis = visible_len(''.join(line))
         if vis > width:
             break_at = last_space_idx if last_space_idx != -1 else len(line) - 1
             cur = ''.join(line[:break_at]).rstrip()
             out.append(cur)
             rem = line[break_at + 1:] if break_at == last_space_idx else line[break_at:]
             line = rem
-            vis = visible_len(''.join(rem))
             last_space_idx = -1
     out.append(''.join(line))
     return [seg if seg != "" else "" for seg in out] or [""]
 
 def compute_widths(headers, rows, term_w):
-    """
-    Decide column widths from content (visible lengths), respecting terminal width.
-    Strategy: use minimums, grow towards desired content lengths, cap to terminal.
-    """
     cols = len(headers)
-    # minimums & caps
     if cols == 2:
         minw = [12, 20]
         caps = [24, 9999]
@@ -599,19 +697,17 @@ def compute_widths(headers, rows, term_w):
         caps = [24, 22, 60, 9999]
 
     desired = [max(minw[i], visible_len(headers[i])) for i in range(cols)]
-    sample_rows = rows[:400]
-    for r in sample_rows:
+    for r in rows[:400]:
         for i in range(cols):
             desired[i] = max(desired[i], min(caps[i], visible_len(str(r[i]))))
 
-    overhead = (cols + 1) + 2 * cols  # borders + spaces
+    overhead = (cols + 1) + 2 * cols
     max_line = max(60, term_w)
     widths = minw[:]
     available = max_line - overhead
     min_sum = sum(widths)
 
     if min_sum > available:
-        # shrink proportionally, but keep at least 5 chars per column
         scale = available / float(min_sum) if min_sum else 1.0
         widths = [max(5, int(w * scale)) for w in widths]
         return widths
@@ -632,7 +728,6 @@ def compute_widths(headers, rows, term_w):
     return widths
 
 def render_table(rows, headers):
-    """Render an ANSI-aware ASCII table with clean, aligned columns."""
     term_w = shutil.get_terminal_size((120, 24)).columns
     cols = len(headers)
     widths = compute_widths(headers, rows, term_w)
@@ -661,30 +756,23 @@ def render_table(rows, headers):
     return "\n".join(out)
 
 def format_screen_rows(found):
-    """Format results for screen (first match per file, with ANSI highlights)."""
     rows = []
     for item in found:
-        host = item['host']
-        share = item['share']
-        path = item['path']
+        host = item['host']; share = item['share']; path = item['path']
         match = item['matches'][0] if item['matches'] else ''
         rows.append([host, share, path, match])
     return rows
 
 def format_plain_rows(found):
-    """Format results for file output (strip ANSI)."""
     rows = []
     for item in found:
-        host = item['host']
-        share = item['share']
-        path = item['path']
+        host = item['host']; share = item['share']; path = item['path']
         match = item['matches'][0] if item['matches'] else ''
         match_plain = strip_ansi(match)
         rows.append([host, share, path, match_plain])
     return rows
 
 def print_results_table(found):
-    """Print results table to screen (with highlights)."""
     if not found:
         print(f"{C.WARNING}No secrets found.{C.END}")
         return
@@ -692,57 +780,262 @@ def print_results_table(found):
     print("\n" + render_table(format_screen_rows(found), headers_scr) + "\n")
 
 def plain_results_table(found):
-    """Build plain results table for saving to file."""
     headers = ["Host", "Share", "Path", "Match"]
     return render_table(format_plain_rows(found), headers)
 
-# ---------- Main ----------
-def clear_screen():
-    """Clear terminal screen."""
-    os.system('clear' if os.name == 'posix' else 'cls')
+# ---------- CLI parsing ----------
+def build_arg_parser():
+    p = argparse.ArgumentParser(description="Secrets Find0r - SMB secret scanner (NTLM/Kerberos)")
+    p.add_argument("cidr", nargs="?", help="CIDR to scan, e.g. 192.168.1.0/24")
 
+    # Auth mode
+    g_auth = p.add_argument_group("Authentication")
+    g_auth.add_argument("--kerberos", action="store_true", help="Use Kerberos instead of NTLM")
+    g_auth.add_argument("--domain", help="Domain/realm for authentication (required for Kerberos)")
+    g_auth.add_argument("--kdc", help="KDC/Domain Controller IP or FQDN (Kerberos)")
+    g_auth.add_argument("--use-cache", action="store_true", help="Use Kerberos credential cache (kinit)")
+    g_auth.add_argument("--target-name", help="SPN remote name (hostname/FQDN) for Kerberos SPN, e.g. filesrv01.domain.tld")
+
+    g_ntlm = p.add_argument_group("NTLM credentials")
+    g_ntlm.add_argument("--username", help="Username (DOMAIN\\user or user)")
+    g_ntlm.add_argument("--password", help="Password (if not using NTLM hash)")
+    g_ntlm.add_argument("--hash", help="NTLM hash (NT or LM:NT)")
+
+    # Behavior/limits
+    g_cfg = p.add_argument_group("Performance & Limits")
+    g_cfg.add_argument("--threads-enum", type=int, help=f"Enumeration workers (default {THREADS_ENUM})")
+    g_cfg.add_argument("--threads-files", type=int, help=f"Download/scan workers (default {THREADS_FILES})")
+    g_cfg.add_argument("--max-file-bytes", type=int, help=f"Max bytes per file (default {MAX_FILE_BYTES})")
+    g_cfg.add_argument("--max-unknown-bytes", type=int, help=f"Max bytes for unknown files (default {MAX_UNKNOWN_BYTES})")
+    g_cfg.add_argument("--max-dir-depth", type=int, help=f"Max directory depth (default {MAX_DIR_DEPTH})")
+    g_cfg.add_argument("--port-probe-timeout", type=float, help=f"TCP connect timeout (default {PORT_PROBE_TIMEOUT})")
+    g_cfg.add_argument("--smb-connect-timeout", type=float, help=f"SMB connect timeout (default {SMB_CONNECT_TIMEOUT})")
+    g_cfg.add_argument("--smb-op-timeout", type=float, help=f"SMB op timeout (default {SMB_OP_TIMEOUT})")
+
+    # Include unknown & keywords control
+    g_scan = p.add_argument_group("Scanning options")
+    g_scan.add_argument("--include-unknown", action="store_true", help="Include unknown/no-extension files if names look sensitive")
+    g_scan.add_argument("--no-include-unknown", action="store_true", help="Do NOT include unknown/no-extension files")
+    g_scan.add_argument("--use-default-keywords", action="store_true", help="Use built-in default keywords (no prompt)")
+    g_scan.add_argument("--keywords", help="Comma-separated custom keywords (overrides default keywords)")
+
+    return p
+
+# ---------- Main ----------
 def main():
     clear_screen()
     print(C.OKCYAN + BANNER + C.END)
     print(C.OKBLUE + imprint + C.END)
 
-    # Credentials
-    username = input("Username (leave empty for anonymous): ").strip()
-    password = getpass.getpass("Password: ") if username else ""
+    parser = build_arg_parser()
+    args = parser.parse_args()
 
-    # CIDR
-    while True:
-        cidr = input("CIDR to scan (e.g. 192.168.1.0/24): ").strip()
-        try:
-            network = ipaddress.ip_network(cidr, strict=False)
-            break
-        except Exception:
-            print("Invalid CIDR, try again.")
+    interactive = False
 
-    # Include unknown/no-extension files?
-    choose_unknown = input("Include unknown/no-extension files if name looks sensitive? [Y/n]: ").strip().lower()
-    include_unknown = (choose_unknown in ("", "y", "yes"))
-
-    # Keywords
-    custom = input("Use default keyword list? [Y/n]: ").strip().lower()
-    if custom in ("n", "no"):
-        kws = input("Enter comma-separated keywords (e.g. password,secret,token): ").strip()
-        keywords_lower = [k.strip().lower() for k in kws.split(",") if k.strip()]
+    # Resolve CIDR
+    if not args.cidr:
+        interactive = True
+        while True:
+            cidr = input("CIDR to scan (e.g. 192.168.1.0/24): ").strip()
+            try:
+                network = ipaddress.ip_network(cidr, strict=False)
+                break
+            except Exception:
+                print(f"{C.FAIL}Invalid CIDR, try again.{C.END}")
     else:
-        keywords_lower = [k.lower() for k in KEYWORDS]
+        try:
+            network = ipaddress.ip_network(args.cidr, strict=False)
+        except Exception:
+            print(f"{C.FAIL}Invalid CIDR provided on CLI.{C.END}")
+            sys.exit(1)
 
+    # ---- Authentication mode selection (interactive prompt) ----
+    if args.kerberos:
+        auth_mode = 'kerberos'
+    else:
+        interactive = True
+        mode_choice = input("Auth mode: [1] NTLM (default)  [2] Kerberos: ").strip()
+        auth_mode = 'kerberos' if mode_choice == '2' else 'ntlm'
+
+    auth = {
+        'mode': auth_mode,
+        'username': args.username,
+        'password': args.password,
+        'lmhash': None,
+        'nthash': None,
+        'domain': args.domain,
+        'kdc': args.kdc,
+        'use_cache': bool(args.use_cache),
+        'target_name': args.target_name,
+        'smb_connect_timeout': args.smb_connect_timeout or SMB_CONNECT_TIMEOUT,
+        'smb_op_timeout': args.smb_op_timeout or SMB_OP_TIMEOUT,
+        'port_probe_timeout': args.port_probe_timeout or PORT_PROBE_TIMEOUT,
+        'max_dir_depth': args.max_dir_depth if args.max_dir_depth is not None else MAX_DIR_DEPTH,
+        'max_file_bytes': args.max_file_bytes or MAX_FILE_BYTES,
+        'max_unknown_bytes': args.max_unknown_bytes or MAX_UNKNOWN_BYTES,
+    }
+
+    # Include unknown?
+    include_unknown = None
+    if args.include_unknown and args.no_include_unknown:
+        print(f"{C.WARNING}Both --include-unknown and --no-include-unknown specified; ignoring both and prompting.{C.END}")
+    elif args.include_unknown:
+        include_unknown = True
+    elif args.no_include_unknown:
+        include_unknown = False
+
+    if include_unknown is None:
+        interactive = True
+        choice = input("Include unknown/no-extension files if name looks sensitive? [Y/n]: ").strip().lower()
+        include_unknown = (choice in ("", "y", "yes"))
+
+    # Keywords selection
+    if args.keywords:
+        keywords_lower = [k.strip().lower() for k in args.keywords.split(',') if k.strip()]
+    elif args.use_default_keywords:
+        keywords_lower = [k.lower() for k in KEYWORDS_DEFAULT]
+    else:
+        interactive = True
+        choice = input("Use default keyword list? [Y/n]: ").strip().lower()
+        if choice in ("", "y", "yes"):
+            keywords_lower = [k.lower() for k in KEYWORDS_DEFAULT]
+        else:
+            kws = input("Enter comma-separated keywords (e.g. password,secret,token): ").strip()
+            keywords_lower = [k.strip().lower() for k in kws.split(",") if k.strip()]
+            if not keywords_lower:
+                keywords_lower = [k.lower() for k in KEYWORDS_DEFAULT]
+
+    # Threads
+    enum_threads = args.threads_enum or THREADS_ENUM
+    file_threads = args.threads_files or THREADS_FILES
+
+    # ---- Collect auth details per mode ----
+    if auth['mode'] == 'kerberos':
+        # Domain required
+        if not auth['domain']:
+            interactive = True
+            while True:
+                auth['domain'] = input("Kerberos Domain (e.g. CONTOSO or CONTOSO.LOCAL - mus be DNS-resolvable or in /etc/hosts): ").strip()
+                if auth['domain']:
+                    break
+                print(f"{C.FAIL}Domain is required for Kerberos.{C.END}")
+
+        if not auth['username']:
+            interactive = True
+            auth['username'] = input("Username (user only, not DOMAIN\\user): ").strip()
+
+        # Cache or secret?
+        if not auth['password'] and not auth['use_cache'] and not args.password and not args.hash:
+            interactive = True
+            use_cache = input("Use Kerberos credential cache (kinit)? [y/N]: ").strip().lower() in ("y", "yes")
+            auth['use_cache'] = use_cache
+
+        if not auth['use_cache'] and not auth['password'] and not args.password and not args.hash:
+            interactive = True
+            use_hash = input("Use NTLM hash instead of password? [y/N]: ").strip().lower() in ("y", "yes")
+            if use_hash:
+                h = input("NTLM hash (NT or LM:NT): ").strip()
+                lm, nt = parse_ntlm_hash(h)
+                if not nt:
+                    print(f"{C.FAIL}Invalid NTLM hash format.{C.END}")
+                    sys.exit(1)
+                auth['lmhash'], auth['nthash'] = lm, nt
+            else:
+                auth['password'] = getpass.getpass("Password: ")
+
+        if args.password and not auth['password']:
+            auth['password'] = args.password
+
+        if args.hash:
+            lm, nt = parse_ntlm_hash(args.hash)
+            if not nt:
+                print(f"{C.FAIL}Invalid NTLM hash format on CLI.{C.END}")
+                sys.exit(1)
+            auth['lmhash'], auth['nthash'] = lm, nt
+
+        if not auth['kdc']:
+            interactive = True
+            auth['kdc'] = input("KDC / Domain Controller (FQDN - mus be DNS-resolvable or in /etc/hosts): ").strip()
+
+        if not auth['target_name']:
+            interactive = True
+            tn = input("Target SPN name (hostname/FQDN used for SPN cifs/<name>) [usually the Domaincontroller's FQDN]: ").strip()
+            auth['target_name'] = tn or None
+
+        # Kerberos sanity test
+        test_host = first_network_host_str(network)
+        if test_host:
+            ok, reason = test_kerberos(auth, test_host)
+            if not ok:
+                if interactive:
+                    print(f"{C.FAIL}Kerberos authentication failed: {reason}{C.END}")
+                    while True:
+                        print("\nAdjust Kerberos parameters (press Enter to keep current):")
+                        new_domain = input(f"Domain [{auth['domain']}]: ").strip() or auth['domain']
+                        new_kdc = input(f"KDC/DC [{auth['kdc']}]: ").strip() or auth['kdc']
+                        new_tn = input(f"Target SPN name [{auth.get('target_name') or 'auto'}]: ").strip()
+                        auth['domain'] = new_domain
+                        auth['kdc'] = new_kdc
+                        auth['target_name'] = new_tn or auth['target_name']
+                        ok, reason = test_kerberos(auth, test_host)
+                        if ok:
+                            print(f"{C.OKGREEN}Kerberos test OK. Continuing...{C.END}")
+                            break
+                        print(f"{C.FAIL}Still failing: {reason}{C.END}")
+                        again = input("Try again? [Y/n]: ").strip().lower()
+                        if again in ('n', 'no'):
+                            sys.exit(1)
+                else:
+                    print(f"{C.FAIL}Kerberos authentication failed: {reason}{C.END}")
+                    print("Hint: verify --domain, --username, --password/--hash/--use-cache, --kdc, and --target-name (SPN).")
+                    sys.exit(1)
+        else:
+            print(f"{C.WARNING}No usable host in the provided CIDR to test Kerberos; continuing without pre-test.{C.END}")
+
+    else:
+        # NTLM mode
+        if not auth['username']:
+            interactive = True
+            auth['username'] = input("Username (DOMAIN\\user or user): ").strip()
+
+        if not auth['password'] and not args.hash:
+            interactive = True
+            use_hash = input("Use NTLM hash instead of password? [y/N]: ").strip().lower() in ("y", "yes")
+            if use_hash:
+                h = input("NTLM hash (NT or LM:NT): ").strip()
+                lm, nt = parse_ntlm_hash(h)
+                if not nt:
+                    print(f"{C.FAIL}Invalid NTLM hash format.{C.END}")
+                    sys.exit(1)
+                auth['lmhash'], auth['nthash'] = lm, nt
+            else:
+                auth['password'] = getpass.getpass("Password: ")
+
+        if args.hash:
+            lm, nt = parse_ntlm_hash(args.hash)
+            if not nt:
+                print(f"{C.FAIL}Invalid NTLM hash format on CLI.{C.END}")
+                sys.exit(1)
+            auth['lmhash'], auth['nthash'] = lm, nt
+
+        if auth['username'] and '\\' in auth['username']:
+            auth['domain'], auth['username'] = auth['username'].split('\\', 1)
+
+    # Hosts & output
     hosts = [str(h) for h in network.hosts()]
-    prefix = username if username else "anon"
+    prefix = (auth.get('domain') + '_' if auth.get('domain') else '') + (auth.get('username') or 'anon')
     output_file = f"{prefix}_secrets_found_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
 
-    print(f"Enumerating shares and candidate files on {len(hosts)} hosts (enum threads={THREADS_ENUM})...")
+    print(f"Enumerating shares and candidate files on {len(hosts)} hosts (enum threads={enum_threads})...")
 
     # Stage 1: enumerate files per host
     file_tasks = []
-    with ThreadPoolExecutor(max_workers=min(THREADS_ENUM, max(4, len(hosts)))) as ex:
-        futures = {ex.submit(enumerate_files_on_host, host, username, password, keywords_lower, include_unknown): host
+    enum_workers = min(enum_threads, max(4, len(hosts)))
+    auth_for_enum = auth.copy()
+    with ThreadPoolExecutor(max_workers=enum_workers) as ex:
+        futures = {ex.submit(enumerate_files_on_host, host, auth_for_enum, keywords_lower, include_unknown): host
                    for host in hosts}
-        for fut in tqdm(as_completed(futures), total=len(futures), desc="Enumerating shares (that'll take a while)", unit="host"):
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="Enumerating shares (this may take a while)", unit="host"):
             try:
                 tasks = fut.result()
                 if tasks:
@@ -754,12 +1047,13 @@ def main():
         print("No candidate files found (no shares with supported/selected file types). Exiting.")
         return
 
-    print(f"Found {len(file_tasks)} candidate files. Scanning files for secrets (file threads={THREADS_FILES})...")
+    print(f"Found {len(file_tasks)} candidate files. Scanning files for secrets (file threads={file_threads})...")
 
-    # Stage 2: scan files (use smaller thread pool to limit open sockets)
+    # Stage 2: scan files
     found = []
-    with ThreadPoolExecutor(max_workers=THREADS_FILES) as ex:
-        futures = {ex.submit(process_file_task_reconnect, task, username, password, keywords_lower): task
+    auth_for_files = auth.copy()
+    with ThreadPoolExecutor(max_workers=file_threads) as ex:
+        futures = {ex.submit(process_file_task_reconnect, task, auth_for_files, keywords_lower): task
                    for task in file_tasks}
         for fut in tqdm(as_completed(futures), total=len(futures), desc="Scanning files", unit="file"):
             try:
@@ -769,15 +1063,17 @@ def main():
             except Exception:
                 continue
 
-    # Output (screen) & save (file)
+    # Output
     print_results_table(found)
 
-    # Write the report at the very end (we kept sockets low and closed earlier)
     plain_table = plain_results_table(found)
-    with open(output_file, "w", encoding="utf-8") as fh:
-        fh.write(f"Secrets Find0r results - {datetime.now().isoformat()}\n")
-        fh.write(plain_table + "\n")
-    print(f"Results saved to: {output_file}")
+    try:
+        with open(output_file, "w", encoding="utf-8") as fh:
+            fh.write(f"Secrets Find0r results - {datetime.now().isoformat()}\n")
+            fh.write(plain_table + "\n")
+        print(f"Results saved to: {output_file}")
+    except OSError as e:
+        print(f"{C.WARNING}Could not write results to file '{output_file}': {e}{C.END}")
 
 if __name__ == "__main__":
     main()
