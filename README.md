@@ -11,13 +11,13 @@ A powerful multi-threaded SMB-share explorer & credential/secret discovery tool.
 * Multithreading: separate pools for enumeration and file scanning
 * Proper closing of connections to avoid resource leaks
 * Configurable parameters: threads, timeouts, max directory depth
-* Auth Modes:** NTLM (password or NT hash) & **Kerberos** (kinit cache or password/hash)
+* Auth Modes: NTLM (password or NT hash) & **Kerberos** (kinit cache or password/hash)
 * Admin share exclusions** by default (`ADMIN$`, `IPC$`, drive shares like `C$`, …)
 * Token-level highlighting** on screen (only the matched word/phrase is colored)
-* File formats:** txt/csv/json/html/eml/rtf/log/xml/yaml/ps1, **docx/xlsx/pptx**, **doc/xls/ppt (OLE)**, **PDF**
-* Multithreaded** enumeration & scanning, **configurable** performance knobs
-* Depth-limited recursion** to avoid massive traversals
-* Plain ASCII report** saved to `USERNAME_secrets_found_YYYYMMDD_HHMMSS.txt`
+* File formats: txt/csv/json/html/rtf/log/xml/yaml/ps1, **docx/xlsx/pptx**, **doc/xls/ppt (OLE)**, **PDF**, **eml/msg E-Mail files**
+* Multithreaded enumeration & scanning, **configurable** performance knobs
+* Depth-limited recursion to avoid massive traversals
+* Plain ASCII report saved to `USERNAME_secrets_found_YYYYMMDD_HHMMSS.txt`
 
 ---
 
