@@ -7,7 +7,7 @@ Secrets Find0r (token-level highlight) with robust Kerberos/NTLM auth
 - Exclude admin shares (ADMIN$, IPC$, PRINT$, [A-Z]$)
 - Robust SMB enumeration with recursion depth limit
 - Optional include of unknown/no-extension files when names look sensitive
-- Legacy Office via olefile; PDF via PyPDF2
+- Legacy Office via olefile; PDF via pypdf with pdfminer.six fallback
 - Multithreaded, progress bars, customizable keywords
 - Kerberos or NTLM auth; NTLM supports LM:NT or NT-only hashes
 - SPN control via --target-name (e.g. filesrv01.contoso.local)
@@ -32,10 +32,17 @@ from tqdm import tqdm
 
 # Optional parsers
 try:
-    import PyPDF2
+    import pypdf as PyPDF2  # Prefer pypdf (modern fork of PyPDF2)
     HAS_PYPDF2 = True
 except Exception:
     HAS_PYPDF2 = False
+
+# Optional: pdfminer.six fallback for tougher PDFs
+try:
+    from pdfminer.high_level import extract_text as pdfminer_extract_text
+    HAS_PDFMINER = True
+except Exception:
+    HAS_PDFMINER = False
 
 try:
     import olefile
@@ -46,7 +53,7 @@ except Exception:
 # ---------- Configurable params (defaults; can be overridden by CLI) ----------
 THREADS_ENUM = 32                  # workers for host/share/file enumeration
 THREADS_FILES = 8                  # workers for file download/scan (keep modest to avoid many sockets)
-MAX_FILE_BYTES = 4 * 1024 * 1024   # max bytes to download per file
+MAX_FILE_BYTES = 12 * 1024 * 1024   # max bytes to download per file - Default: 12 MB
 MAX_UNKNOWN_BYTES = 256 * 1024     # cap for unknown/no-extension files if included
 MAX_DIR_DEPTH = 2                  # max directory depth (root '\' = 0); None = unlimited
 PORT_PROBE_TIMEOUT = 0.5           # TCP connect timeout for port 445
@@ -122,7 +129,7 @@ BANNER = r"""
                                                                            
 """
 imprint = r"""
-                  Secrets Find0r v1.1
+                  Secrets Find0r v1.2
            by Benjamin Iheukumere | SafeLink IT
                b.iheukumere@safelink-it.com
 """
@@ -255,20 +262,53 @@ def extract_text_from_office_xml(data_bytes: bytes) -> str:
     return "\n".join(texts)
 
 def extract_text_from_pdf(data_bytes: bytes) -> str:
-    """Extract text from PDF if PyPDF2 is available."""
-    if not HAS_PYPDF2:
-        return ""
+    """
+    Prefer pypdf for speed; if it yields little/empty text, or covers
+    <80% of pages with non-empty text, fall back to pdfminer.six too.
+    Return combined text.
+    """
     texts = []
-    try:
-        reader = PyPDF2.PdfReader(io.BytesIO(data_bytes))
-        for p in reader.pages:
-            try:
-                texts.append(p.extract_text() or "")
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return "\n".join(texts)
+    total_pages = 0
+    pypdf_pages_with_text = 0
+
+    # Try pypdf first (fast)
+    if HAS_PYPDF2:
+        try:
+            reader = PyPDF2.PdfReader(io.BytesIO(data_bytes))
+            total_pages = len(reader.pages)
+            for p in reader.pages:
+                try:
+                    t = p.extract_text() or ""
+                    if t.strip():
+                        pypdf_pages_with_text += 1
+                        texts.append(t)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    joined = "\n".join(texts)
+
+    # If output looks tiny or page coverage is low, try pdfminer (slower but thorough)
+    need_fallback = False
+    if HAS_PDFMINER:
+        if len(joined) < 200:
+            need_fallback = True
+        else:
+            if total_pages:
+                coverage = pypdf_pages_with_text / total_pages
+                if coverage < 0.8:  # less than 80% of pages yielded text via pypdf
+                    need_fallback = True
+
+    if need_fallback:
+        try:
+            pm_text = pdfminer_extract_text(io.BytesIO(data_bytes)) or ""
+            if pm_text:
+                joined = pm_text if not joined else f"{joined}\n{pm_text}"
+        except Exception:
+            pass
+
+    return joined
 
 def extract_text_from_ole(data_bytes: bytes) -> str:
     """Extract rough text from legacy Office (doc/xls/ppt) using olefile."""
@@ -628,8 +668,8 @@ def process_file_task_reconnect(task, auth, keywords_lower):
             text = extract_text_from_pdf(b)
             if text:
                 matches.extend(scan_text_for_keywords(text, keywords_lower))
-            else:
-                matches.extend(scan_bytes_for_patterns(b, keywords_lower))
+            # Always also scan bytes for PDFs to catch additional patterns
+            matches.extend(scan_bytes_for_patterns(b, keywords_lower))
 
         elif ext in EXTS_TEXT:
             text = to_text(b)
@@ -756,20 +796,32 @@ def render_table(rows, headers):
     return "\n".join(out)
 
 def format_screen_rows(found):
+    """
+    Show ALL matches per file, one row per match,
+    so large PDFs with many hits are fully represented.
+    """
     rows = []
     for item in found:
         host = item['host']; share = item['share']; path = item['path']
-        match = item['matches'][0] if item['matches'] else ''
-        rows.append([host, share, path, match])
+        if item['matches']:
+            for m in item['matches']:
+                rows.append([host, share, path, m])
+        else:
+            rows.append([host, share, path, ""])
     return rows
 
 def format_plain_rows(found):
+    """
+    Plain (no ANSI) version with ALL matches per file, one row per match.
+    """
     rows = []
     for item in found:
         host = item['host']; share = item['share']; path = item['path']
-        match = item['matches'][0] if item['matches'] else ''
-        match_plain = strip_ansi(match)
-        rows.append([host, share, path, match_plain])
+        if item['matches']:
+            for m in item['matches']:
+                rows.append([host, share, path, strip_ansi(m)])
+        else:
+            rows.append([host, share, path, ""])
     return rows
 
 def print_results_table(found):
