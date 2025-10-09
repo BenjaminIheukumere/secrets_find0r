@@ -1,4 +1,14 @@
-impacket
-tqdm
-olefile
-PyPDF2
+# Core SMB + auth
+impacket>=0.12.0
+
+# Progress bars
+tqdm>=4.66.0
+
+# PDF parsing (primary)
+pypdf>=3.17.0
+
+# PDF parsing (fallback for tough PDFs)
+pdfminer.six>=20231228
+
+# Legacy Office (doc/xls/ppt)
+olefile>=0.47
