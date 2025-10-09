@@ -24,6 +24,7 @@ import ipaddress
 import getpass
 import shutil
 import argparse
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
@@ -50,10 +51,20 @@ try:
 except Exception:
     HAS_OLEFILE = False
 
+# Email parsing
+import email
+from email import policy
+from email.parser import BytesParser
+try:
+    import extract_msg
+    HAS_EXTRACT_MSG = True
+except Exception:
+    HAS_EXTRACT_MSG = False
+
 # ---------- Configurable params (defaults; can be overridden by CLI) ----------
 THREADS_ENUM = 32                  # workers for host/share/file enumeration
 THREADS_FILES = 8                  # workers for file download/scan (keep modest to avoid many sockets)
-MAX_FILE_BYTES = 12 * 1024 * 1024   # max bytes to download per file - Default: 12 MB
+MAX_FILE_BYTES = 128 * 1024 * 1024   # max bytes to download per file - Default: 128 MB
 MAX_UNKNOWN_BYTES = 256 * 1024     # cap for unknown/no-extension files if included
 MAX_DIR_DEPTH = 2                  # max directory depth (root '\' = 0); None = unlimited
 PORT_PROBE_TIMEOUT = 0.5           # TCP connect timeout for port 445
@@ -83,7 +94,7 @@ REGEX_PATTERNS = [
 
 # Supported extensions (extended)
 EXTS_TEXT = {
-    '.txt', '.csv', '.json', '.html', '.htm', '.eml', '.rtf',
+    '.txt', '.csv', '.json', '.html', '.htm', '.rtf',
     '.ps1', '.psm1', '.psd1', '.msf', '.ini', '.conf', '.cnf',
     '.config', '.xml', '.log', '.env', '.properties', '.yaml', '.yml',
     '.bat', '.cmd', '.vbs'
@@ -91,7 +102,8 @@ EXTS_TEXT = {
 EXTS_OFFICE_XML = {'.docx', '.pptx', '.xlsx'}
 EXTS_PDF = {'.pdf'}
 EXTS_BINARY_OFFICE = {'.doc', '.xls', '.ppt'}
-SUPPORTED_EXTS = EXTS_TEXT | EXTS_OFFICE_XML | EXTS_PDF | EXTS_BINARY_OFFICE
+EXTS_EMAIL = {'.eml', '.msg'}
+SUPPORTED_EXTS = EXTS_TEXT | EXTS_OFFICE_XML | EXTS_PDF | EXTS_BINARY_OFFICE | EXTS_EMAIL
 
 class C:
     HEADER = '\033[95m'
@@ -129,7 +141,7 @@ BANNER = r"""
                                                                            
 """
 imprint = r"""
-                  Secrets Find0r v1.2
+                  Secrets Find0r v1.4
            by Benjamin Iheukumere | SafeLink IT
                b.iheukumere@safelink-it.com
 """
@@ -215,6 +227,74 @@ def first_network_host_str(network):
         pass
     return None
 
+# ---------- Safe stderr silencer (prevents progress-bar breaks) ----------
+_STDERR_LOCK = threading.Lock()
+# Keep a single devnull file handle for the entire process; never close it to avoid
+# "I/O operation on closed file" if a lib holds the reference after we restore.
+_DEVNULL = open(os.devnull, 'w')
+
+class _QuietStderr:
+    def __enter__(self):
+        self._prev = sys.stderr
+        with _STDERR_LOCK:
+            sys.stderr = _DEVNULL  # do NOT close _DEVNULL
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        with _STDERR_LOCK:
+            sys.stderr = self._prev
+        return False
+
+def quiet_stderr():
+    """Context manager to silence stderr only (keeps stdout for tqdm/progress)."""
+    return _QuietStderr()
+
+# ---------- Live status (single line under bars) ----------
+_STATUS_LOCK = threading.Lock()
+
+def _print_status_below_bar(text: str):
+    """
+    Draw/update a single status line directly below the current cursor line.
+    Uses ANSI save/restore to avoid interfering with tqdm's bar.
+    """
+    try:
+        width = shutil.get_terminal_size((120, 24)).columns
+    except Exception:
+        width = 120
+    shown = text[:max(1, width - 1)]
+    with _STATUS_LOCK:
+        # Save cursor, go to next line, clear, print, restore
+        sys.stdout.write('\x1b7')          # save cursor position
+        sys.stdout.write('\x1b[1E')        # move to beginning of the next line
+        sys.stdout.write('\x1b[2K')        # clear entire line
+        sys.stdout.write(shown)
+        sys.stdout.write('\x1b8')          # restore cursor position
+        sys.stdout.flush()
+
+def make_enum_status_cb():
+    def cb(host: str, share: str, path: str):
+        # UNC path (normalize separators)
+        if not path.startswith('\\'):
+            path = '\\' + path
+        msg = f"Enumerating: \\\\{host}\\{share}{path}"
+        _print_status_below_bar(msg)
+    return cb
+
+def make_scan_status_cb():
+    def cb(host: str, share: str, path: str):
+        if not path.startswith('\\'):
+            path = '\\' + path
+        msg = f"Scanning:    \\\\{host}\\{share}{path}"
+        _print_status_below_bar(msg)
+    return cb
+
+def clear_status_line():
+    with _STATUS_LOCK:
+        sys.stdout.write('\x1b7')
+        sys.stdout.write('\x1b[1E')
+        sys.stdout.write('\x1b[2K')
+        sys.stdout.write('\x1b8')
+        sys.stdout.flush()
+
 # ----- Highlight helpers -----
 def make_snippet_with_highlights(text: str, start_idx: int, end_idx: int, terms):
     """Build a context snippet around [start:end] and highlight only the matched terms."""
@@ -261,11 +341,94 @@ def extract_text_from_office_xml(data_bytes: bytes) -> str:
         pass
     return "\n".join(texts)
 
+def _strip_html_to_text(html: str) -> str:
+    # lightweight HTML->text without external deps
+    html = re.sub(r'(?is)<(script|style).*?>.*?</\1>', ' ', html)
+    html = re.sub(r'(?is)<br\s*/?>', '\n', html)
+    html = re.sub(r'(?is)</p\s*>', '\n', html)
+    html = re.sub(r'(?is)<.*?>', ' ', html)
+    html = re.sub(r'[ \t\r\f\v]+', ' ', html)
+    html = re.sub(r'\n\s*\n+', '\n\n', html)
+    return html.strip()
+
+def extract_text_from_eml(data_bytes: bytes) -> str:
+    """
+    Parse .eml (RFC822/MIME) and return human-readable text.
+    Prefer text/plain; fallback to text/html stripped.
+    """
+    try:
+        msg = BytesParser(policy=policy.default).parsebytes(data_bytes)
+    except Exception:
+        try:
+            msg = email.message_from_bytes(data_bytes)
+        except Exception:
+            return ""
+    parts = []
+
+    def _maybe_add(part):
+        try:
+            ctype = part.get_content_type()
+        except Exception:
+            ctype = part.get('Content-Type', '') or ''
+        try:
+            payload = part.get_content()
+        except Exception:
+            try:
+                payload = part.get_payload(decode=True)
+                if isinstance(payload, bytes):
+                    payload = to_text(payload)
+            except Exception:
+                payload = None
+        if not payload:
+            return
+        if 'text/plain' in ctype:
+            parts.append(str(payload))
+        elif 'text/html' in ctype:
+            parts.append(_strip_html_to_text(str(payload)))
+
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.is_multipart():
+                continue
+            _maybe_add(part)
+    else:
+        _maybe_add(msg)
+
+    if not parts:
+        parts.append(to_text(data_bytes))
+    return "\n\n".join(p for p in parts if p).strip()
+
+def extract_text_from_msg(data_bytes: bytes) -> str:
+    """
+    Parse Outlook .msg via extract-msg. Uses a temp file to support bytes input.
+    Returns combined plain and (stripped) HTML bodies if present.
+    """
+    if not HAS_EXTRACT_MSG:
+        return ""
+    import tempfile
+    text = ""
+    try:
+        with tempfile.NamedTemporaryFile(delete=True, suffix=".msg") as tf:
+            tf.write(data_bytes)
+            tf.flush()
+            with quiet_stderr():  # silence any library prints to stderr
+                m = extract_msg.Message(tf.name)
+            plain = getattr(m, 'body', None)
+            html = getattr(m, 'htmlBody', None)
+            if html and not plain:
+                plain = _strip_html_to_text(html)
+            elif html:
+                plain = (plain or "") + "\n\n" + _strip_html_to_text(html)
+            text = (plain or "").strip()
+    except Exception:
+        return ""
+    return text
+
 def extract_text_from_pdf(data_bytes: bytes) -> str:
     """
     Prefer pypdf for speed; if it yields little/empty text, or covers
     <80% of pages with non-empty text, fall back to pdfminer.six too.
-    Return combined text.
+    Return combined text. Any noisy parser warnings are silenced from stderr.
     """
     texts = []
     total_pages = 0
@@ -274,16 +437,17 @@ def extract_text_from_pdf(data_bytes: bytes) -> str:
     # Try pypdf first (fast)
     if HAS_PYPDF2:
         try:
-            reader = PyPDF2.PdfReader(io.BytesIO(data_bytes))
-            total_pages = len(reader.pages)
-            for p in reader.pages:
-                try:
-                    t = p.extract_text() or ""
-                    if t.strip():
-                        pypdf_pages_with_text += 1
-                        texts.append(t)
-                except Exception:
-                    continue
+            with quiet_stderr():  # silence warnings like "Ignoring wrong pointing object ..."
+                reader = PyPDF2.PdfReader(io.BytesIO(data_bytes))
+                total_pages = len(reader.pages)
+                for p in reader.pages:
+                    try:
+                        t = p.extract_text() or ""
+                        if t.strip():
+                            pypdf_pages_with_text += 1
+                            texts.append(t)
+                    except Exception:
+                        continue
         except Exception:
             pass
 
@@ -302,7 +466,8 @@ def extract_text_from_pdf(data_bytes: bytes) -> str:
 
     if need_fallback:
         try:
-            pm_text = pdfminer_extract_text(io.BytesIO(data_bytes)) or ""
+            with quiet_stderr():
+                pm_text = pdfminer_extract_text(io.BytesIO(data_bytes)) or ""
             if pm_text:
                 joined = pm_text if not joined else f"{joined}\n{pm_text}"
         except Exception:
@@ -538,7 +703,7 @@ def download_file_smb_by_conn(host, auth, share, path, max_bytes=MAX_FILE_BYTES)
                 pass
     return buf.getvalue()
 
-def enumerate_files_on_host(host, auth, keywords_lower, include_unknown=True):
+def enumerate_files_on_host(host, auth, keywords_lower, include_unknown=True, status_cb=None):
     """Enumerate interesting files on all accessible shares of a host, honoring MAX_DIR_DEPTH."""
     tasks = []
     if not port_open(host, 445, timeout=auth.get('port_probe_timeout', PORT_PROBE_TIMEOUT)):
@@ -578,6 +743,7 @@ def enumerate_files_on_host(host, auth, keywords_lower, include_unknown=True):
                     continue
                 visited.add(key)
 
+                # Build pattern and normalized current dir
                 if cur in ('\\', ''):
                     pattern = '\\*'
                     current_dir = '\\'
@@ -586,12 +752,20 @@ def enumerate_files_on_host(host, auth, keywords_lower, include_unknown=True):
                     pattern = p + '\\*'
                     current_dir = '\\' + p if not p.startswith('\\') else p
 
+                # Status: current folder UNC
+                if status_cb:
+                    try:
+                        status_cb(host, share, current_dir)
+                    except Exception:
+                        pass
+
                 try:
                     entries = conn.listPath(share, pattern)
                 except Exception:
                     continue
 
                 for e in entries:
+                    # Obtain name robustly
                     fname = None
                     for getter in ('get_longname', 'getFileName', 'get_shortname'):
                         try:
@@ -603,11 +777,20 @@ def enumerate_files_on_host(host, auth, keywords_lower, include_unknown=True):
                     if not fname or fname in ('.', '..'):
                         continue
 
+                    # Full path within the share
                     if current_dir in ('\\', ''):
                         full = '\\' + fname
                     else:
                         full = current_dir.rstrip('\\') + '\\' + fname
 
+                    # Status: each entry touched
+                    if status_cb:
+                        try:
+                            status_cb(host, share, full)
+                        except Exception:
+                            pass
+
+                    # Directory?
                     if _is_dir_entry(e):
                         max_depth = auth.get('max_dir_depth', MAX_DIR_DEPTH)
                         if max_depth is not None:
@@ -617,6 +800,7 @@ def enumerate_files_on_host(host, auth, keywords_lower, include_unknown=True):
                         stack.append(full)
                         continue
 
+                    # File filter
                     name_l = fname.lower()
                     ext = os.path.splitext(name_l)[1]
                     interesting_name = any(kw in name_l for kw in ["pass", "pwd", "secret", "cred", "token", "key"])
@@ -639,9 +823,15 @@ def enumerate_files_on_host(host, auth, keywords_lower, include_unknown=True):
     return tasks
 
 # ---------- File processing ----------
-def process_file_task_reconnect(task, auth, keywords_lower):
+def process_file_task_reconnect(task, auth, keywords_lower, status_cb=None):
     """Reconnect for each file, download (capped), extract text, and scan for matches."""
     host, share, filepath = task
+    if status_cb:
+        try:
+            status_cb(host, share, filepath if "|unknown<" not in filepath else filepath.split("|unknown<",1)[0])
+        except Exception:
+            pass
+
     limit = auth.get('max_file_bytes', MAX_FILE_BYTES)
     if "|unknown<" in filepath:
         path_only, marker = filepath.split("|unknown<", 1)
@@ -669,6 +859,15 @@ def process_file_task_reconnect(task, auth, keywords_lower):
             if text:
                 matches.extend(scan_text_for_keywords(text, keywords_lower))
             # Always also scan bytes for PDFs to catch additional patterns
+            matches.extend(scan_bytes_for_patterns(b, keywords_lower))
+
+        elif ext in EXTS_EMAIL:
+            if ext == '.eml':
+                text = extract_text_from_eml(b)
+            else:
+                text = extract_text_from_msg(b)
+            if text:
+                matches.extend(scan_text_for_keywords(text, keywords_lower))
             matches.extend(scan_bytes_for_patterns(b, keywords_lower))
 
         elif ext in EXTS_TEXT:
@@ -1080,20 +1279,25 @@ def main():
 
     print(f"Enumerating shares and candidate files on {len(hosts)} hosts (enum threads={enum_threads})...")
 
-    # Stage 1: enumerate files per host
+    # Stage 1: enumerate files per host (with live status below bar)
     file_tasks = []
     enum_workers = min(enum_threads, max(4, len(hosts)))
     auth_for_enum = auth.copy()
+    enum_status_cb = make_enum_status_cb()
+
     with ThreadPoolExecutor(max_workers=enum_workers) as ex:
-        futures = {ex.submit(enumerate_files_on_host, host, auth_for_enum, keywords_lower, include_unknown): host
+        futures = {ex.submit(enumerate_files_on_host, host, auth_for_enum, keywords_lower, include_unknown, enum_status_cb): host
                    for host in hosts}
-        for fut in tqdm(as_completed(futures), total=len(futures), desc="Enumerating shares (this may take a while)", unit="host"):
+        pbar = tqdm(as_completed(futures), total=len(futures), desc="Enumerating shares (this may take a while)", unit="host")
+        for fut in pbar:
             try:
                 tasks = fut.result()
                 if tasks:
                     file_tasks.extend(tasks)
             except Exception:
                 continue
+        # Clear the extra status line after this bar completes
+        clear_status_line()
 
     if not file_tasks:
         print("No candidate files found (no shares with supported/selected file types). Exiting.")
@@ -1101,19 +1305,23 @@ def main():
 
     print(f"Found {len(file_tasks)} candidate files. Scanning files for secrets (file threads={file_threads})...")
 
-    # Stage 2: scan files
+    # Stage 2: scan files (with live status below bar)
     found = []
     auth_for_files = auth.copy()
+    scan_status_cb = make_scan_status_cb()
+
     with ThreadPoolExecutor(max_workers=file_threads) as ex:
-        futures = {ex.submit(process_file_task_reconnect, task, auth_for_files, keywords_lower): task
+        futures = {ex.submit(process_file_task_reconnect, task, auth_for_files, keywords_lower, scan_status_cb): task
                    for task in file_tasks}
-        for fut in tqdm(as_completed(futures), total=len(futures), desc="Scanning files", unit="file"):
+        pbar2 = tqdm(as_completed(futures), total=len(futures), desc="Scanning files", unit="file")
+        for fut in pbar2:
             try:
                 res = fut.result()
                 if res:
                     found.append(res)
             except Exception:
                 continue
+        clear_status_line()
 
     # Output
     print_results_table(found)
