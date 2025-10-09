@@ -12,3 +12,6 @@ pdfminer.six>=20231228
 
 # Legacy Office (doc/xls/ppt)
 olefile>=0.47
+
+# Extract msg E-Mail files
+extract-msg>=0.47.6
