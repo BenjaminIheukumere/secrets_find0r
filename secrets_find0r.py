@@ -8,7 +8,8 @@ Secrets Find0r (token-level highlight) with robust Kerberos/NTLM auth
 - Robust SMB enumeration with recursion depth limit
 - Optional include of unknown/no-extension files when names look sensitive
 - Legacy Office via olefile; PDF via pypdf with pdfminer.six fallback
-- Multithreaded, progress bars, customizable keywords
+- Multithreaded progress + live status for current UNC path
+- True multi-core CPU parsing via ProcessPoolExecutor
 - Kerberos or NTLM auth; NTLM supports LM:NT or NT-only hashes
 - SPN control via --target-name (e.g. filesrv01.contoso.local)
 - Interactive and CLI modes; Kerberos auth test + error loop in interactive
@@ -25,7 +26,7 @@ import getpass
 import shutil
 import argparse
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from datetime import datetime
 
 from impacket.smbconnection import SMBConnection
@@ -62,14 +63,15 @@ except Exception:
     HAS_EXTRACT_MSG = False
 
 # ---------- Configurable params (defaults; can be overridden by CLI) ----------
-THREADS_ENUM = 32                  # workers for host/share/file enumeration
-THREADS_FILES = 8                  # workers for file download/scan (keep modest to avoid many sockets)
-MAX_FILE_BYTES = 128 * 1024 * 1024   # max bytes to download per file - Default: 128 MB
-MAX_UNKNOWN_BYTES = 256 * 1024     # cap for unknown/no-extension files if included
-MAX_DIR_DEPTH = 2                  # max directory depth (root '\' = 0); None = unlimited
-PORT_PROBE_TIMEOUT = 0.5           # TCP connect timeout for port 445
-SMB_CONNECT_TIMEOUT = 5            # SMBConnection connect timeout
-SMB_OP_TIMEOUT = 5                 # SMB operation timeout
+THREADS_ENUM = 32                     # workers for host/share/file enumeration
+THREADS_FILES = 8                     # workers for SMB download stage (I/O)
+PROCS_PARSE = max(1, os.cpu_count() or 1)  # workers for CPU parsing
+MAX_FILE_BYTES = 128 * 1024 * 1024    # max bytes to download per file
+MAX_UNKNOWN_BYTES = 256 * 1024        # cap for unknown/no-extension files if included
+MAX_DIR_DEPTH = 2                     # max directory depth (root '\' = 0); None = unlimited
+PORT_PROBE_TIMEOUT = 0.5              # TCP connect timeout for port 445
+SMB_CONNECT_TIMEOUT = 5               # SMBConnection connect timeout
+SMB_OP_TIMEOUT = 5                    # SMB operation timeout
 
 # Exclude default/admin shares (configurable)
 EXCLUDE_SHARES = {
@@ -141,9 +143,9 @@ BANNER = r"""
                                                                            
 """
 imprint = r"""
-                  Secrets Find0r v1.4
-           by Benjamin Iheukumere | SafeLink IT
-               b.iheukumere@safelink-it.com
+                  Secrets Find0r v1.5 (multicore)
+                by Benjamin Iheukumere | SafeLink IT
+                    b.iheukumere@safelink-it.com
 """
 
 ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
@@ -229,15 +231,14 @@ def first_network_host_str(network):
 
 # ---------- Safe stderr silencer (prevents progress-bar breaks) ----------
 _STDERR_LOCK = threading.Lock()
-# Keep a single devnull file handle for the entire process; never close it to avoid
-# "I/O operation on closed file" if a lib holds the reference after we restore.
+# Keep a single devnull handle for the entire process lifetime
 _DEVNULL = open(os.devnull, 'w')
 
 class _QuietStderr:
     def __enter__(self):
         self._prev = sys.stderr
         with _STDERR_LOCK:
-            sys.stderr = _DEVNULL  # do NOT close _DEVNULL
+            sys.stderr = _DEVNULL
         return self
     def __exit__(self, exc_type, exc, tb):
         with _STDERR_LOCK:
@@ -262,7 +263,6 @@ def _print_status_below_bar(text: str):
         width = 120
     shown = text[:max(1, width - 1)]
     with _STATUS_LOCK:
-        # Save cursor, go to next line, clear, print, restore
         sys.stdout.write('\x1b7')          # save cursor position
         sys.stdout.write('\x1b[1E')        # move to beginning of the next line
         sys.stdout.write('\x1b[2K')        # clear entire line
@@ -272,7 +272,6 @@ def _print_status_below_bar(text: str):
 
 def make_enum_status_cb():
     def cb(host: str, share: str, path: str):
-        # UNC path (normalize separators)
         if not path.startswith('\\'):
             path = '\\' + path
         msg = f"Enumerating: \\\\{host}\\{share}{path}"
@@ -342,7 +341,6 @@ def extract_text_from_office_xml(data_bytes: bytes) -> str:
     return "\n".join(texts)
 
 def _strip_html_to_text(html: str) -> str:
-    # lightweight HTML->text without external deps
     html = re.sub(r'(?is)<(script|style).*?>.*?</\1>', ' ', html)
     html = re.sub(r'(?is)<br\s*/?>', '\n', html)
     html = re.sub(r'(?is)</p\s*>', '\n', html)
@@ -352,10 +350,7 @@ def _strip_html_to_text(html: str) -> str:
     return html.strip()
 
 def extract_text_from_eml(data_bytes: bytes) -> str:
-    """
-    Parse .eml (RFC822/MIME) and return human-readable text.
-    Prefer text/plain; fallback to text/html stripped.
-    """
+    """Parse .eml (RFC822/MIME) and return human-readable text."""
     try:
         msg = BytesParser(policy=policy.default).parsebytes(data_bytes)
     except Exception:
@@ -364,7 +359,6 @@ def extract_text_from_eml(data_bytes: bytes) -> str:
         except Exception:
             return ""
     parts = []
-
     def _maybe_add(part):
         try:
             ctype = part.get_content_type()
@@ -385,7 +379,6 @@ def extract_text_from_eml(data_bytes: bytes) -> str:
             parts.append(str(payload))
         elif 'text/html' in ctype:
             parts.append(_strip_html_to_text(str(payload)))
-
     if msg.is_multipart():
         for part in msg.walk():
             if part.is_multipart():
@@ -393,16 +386,12 @@ def extract_text_from_eml(data_bytes: bytes) -> str:
             _maybe_add(part)
     else:
         _maybe_add(msg)
-
     if not parts:
         parts.append(to_text(data_bytes))
     return "\n\n".join(p for p in parts if p).strip()
 
 def extract_text_from_msg(data_bytes: bytes) -> str:
-    """
-    Parse Outlook .msg via extract-msg. Uses a temp file to support bytes input.
-    Returns combined plain and (stripped) HTML bodies if present.
-    """
+    """Parse Outlook .msg via extract-msg (using temp file for bytes input)."""
     if not HAS_EXTRACT_MSG:
         return ""
     import tempfile
@@ -411,7 +400,7 @@ def extract_text_from_msg(data_bytes: bytes) -> str:
         with tempfile.NamedTemporaryFile(delete=True, suffix=".msg") as tf:
             tf.write(data_bytes)
             tf.flush()
-            with quiet_stderr():  # silence any library prints to stderr
+            with quiet_stderr():
                 m = extract_msg.Message(tf.name)
             plain = getattr(m, 'body', None)
             html = getattr(m, 'htmlBody', None)
@@ -426,18 +415,16 @@ def extract_text_from_msg(data_bytes: bytes) -> str:
 
 def extract_text_from_pdf(data_bytes: bytes) -> str:
     """
-    Prefer pypdf for speed; if it yields little/empty text, or covers
-    <80% of pages with non-empty text, fall back to pdfminer.six too.
-    Return combined text. Any noisy parser warnings are silenced from stderr.
+    Prefer pypdf for speed; if output is tiny or coverage <80%, also use pdfminer.
+    Silences parser warnings to avoid progress-bar breakage.
     """
     texts = []
     total_pages = 0
     pypdf_pages_with_text = 0
 
-    # Try pypdf first (fast)
     if HAS_PYPDF2:
         try:
-            with quiet_stderr():  # silence warnings like "Ignoring wrong pointing object ..."
+            with quiet_stderr():
                 reader = PyPDF2.PdfReader(io.BytesIO(data_bytes))
                 total_pages = len(reader.pages)
                 for p in reader.pages:
@@ -453,7 +440,6 @@ def extract_text_from_pdf(data_bytes: bytes) -> str:
 
     joined = "\n".join(texts)
 
-    # If output looks tiny or page coverage is low, try pdfminer (slower but thorough)
     need_fallback = False
     if HAS_PDFMINER:
         if len(joined) < 200:
@@ -461,7 +447,7 @@ def extract_text_from_pdf(data_bytes: bytes) -> str:
         else:
             if total_pages:
                 coverage = pypdf_pages_with_text / total_pages
-                if coverage < 0.8:  # less than 80% of pages yielded text via pypdf
+                if coverage < 0.8:
                     need_fallback = True
 
     if need_fallback:
@@ -517,10 +503,8 @@ def scan_bytes_for_patterns(bdata: bytes, keywords_lower):
     results = []
     text = to_text(bdata)
 
-    # Keywords
     results.extend(scan_text_for_keywords(text, keywords_lower))
 
-    # Regexes
     for pat in REGEX_PATTERNS:
         for mb in pat.finditer(bdata):
             full = mb.group(0).decode(errors='ignore')
@@ -543,7 +527,6 @@ def scan_bytes_for_patterns(bdata: bytes, keywords_lower):
                 snippet = highlight_by_terms_in_text(full, anchor_terms)
             results.append(snippet)
 
-    # Deduplicate preserving order
     seen = set(); out = []
     for r in results:
         if r not in seen:
@@ -553,13 +536,11 @@ def scan_bytes_for_patterns(bdata: bytes, keywords_lower):
 # ---------- SMB helpers ----------
 def _is_dir_entry(e):
     """Robustly decide if an SMB listPath entry is a directory."""
-    # 1) Preferred API
     for attr in ("isDirectory", "is_directory"):
         try:
             return bool(getattr(e, attr)())
         except Exception:
             pass
-    # 2) Attribute bit (FILE_ATTRIBUTE_DIRECTORY = 0x10)
     for attr_getter in ("get_attributes", "getAttributes", "get_attr"):
         try:
             attrs = getattr(e, attr_getter)()
@@ -567,30 +548,22 @@ def _is_dir_entry(e):
                 return bool(attrs & 0x10)
         except Exception:
             pass
-    # 3) Fallback boolean field
     try:
         return bool(getattr(e, "is_directory"))
     except Exception:
         return False
 
 def share_is_excluded(name: str) -> bool:
-    """Return True if share name should be excluded (admin/system shares)."""
     if not name:
         return True
     up = name.upper()
     if up in EXCLUDE_SHARES:
         return True
-    if EXCLUDE_SHARE_REGEX.match(up):   # C$, D$, E$, ...
+    if EXCLUDE_SHARE_REGEX.match(up):
         return True
     return False
 
 def build_remote_name(host: str, target_name: str | None, kerberos: bool) -> str:
-    """
-    Decide the 'remoteName' argument for SMBConnection:
-    - If target_name provided, use it.
-    - Else for Kerberos, prefer FQDN (helps SPN cifs/fqdn).
-    - Else fall back to host.
-    """
     if target_name:
         return target_name
     if kerberos:
@@ -603,10 +576,7 @@ def build_remote_name(host: str, target_name: str | None, kerberos: bool) -> str
     return host
 
 def new_conn(host, auth):
-    """
-    Create and login an SMBConnection with configured timeouts.
-    Supports NTLM and Kerberos. Returns (conn, error_msg) where error_msg is None on success.
-    """
+    """Create and login an SMBConnection with configured timeouts."""
     kerberos = (auth.get('mode') == 'kerberos')
     remote_name = build_remote_name(host, auth.get('target_name'), kerberos)
 
@@ -626,12 +596,9 @@ def new_conn(host, auth):
 
     try:
         if kerberos:
-            conn.kerberosLogin(user, password, domain,
-                               lmhash, nthash,
-                               aesKey='',
-                               TGT=None, TGS=None,
-                               useCache=use_cache,
-                               kdcHost=kdc)
+            conn.kerberosLogin(user, password, domain, lmhash, nthash,
+                               aesKey='', TGT=None, TGS=None,
+                               useCache=use_cache, kdcHost=kdc)
         else:
             if nthash and len(nthash) == 32:
                 conn.login(user, '', domain, lmhash=lmhash, nthash=nthash)
@@ -639,17 +606,11 @@ def new_conn(host, auth):
                 conn.login(user, password, domain)
         return conn, None
     except Exception as e:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        try: conn.close()
+        except Exception: pass
         return None, str(e)
 
 def test_kerberos(auth, test_host):
-    """
-    Try a short Kerberos session to validate KDC/domain/target-name combo.
-    Returns (True, None) on success, else (False, reason).
-    """
     conn, err = new_conn(test_host, auth)
     if err or not conn:
         return False, f"{err}"
@@ -659,20 +620,14 @@ def test_kerberos(auth, test_host):
     except Exception as e:
         return False, str(e)
     finally:
-        try:
-            conn.logoff()
-        except Exception:
-            pass
-        try:
-            conn.close()
-        except Exception:
-            pass
+        try: conn.logoff()
+        except Exception: pass
+        try: conn.close()
+        except Exception: pass
 
 def download_file_smb_by_conn(host, auth, share, path, max_bytes=MAX_FILE_BYTES) -> bytes:
     """Download up to max_bytes from a file via a fresh SMB connection (always closed)."""
-    buf = io.BytesIO()
-    got = 0
-    conn = None
+    buf = io.BytesIO(); got = 0; conn = None
     try:
         conn, err = new_conn(host, auth)
         if err or not conn:
@@ -693,14 +648,10 @@ def download_file_smb_by_conn(host, auth, share, path, max_bytes=MAX_FILE_BYTES)
         return b''
     finally:
         if conn:
-            try:
-                conn.logoff()
-            except Exception:
-                pass
-            try:
-                conn.close()
-            except Exception:
-                pass
+            try: conn.logoff()
+            except Exception: pass
+            try: conn.close()
+            except Exception: pass
     return buf.getvalue()
 
 def enumerate_files_on_host(host, auth, keywords_lower, include_unknown=True, status_cb=None):
@@ -743,7 +694,6 @@ def enumerate_files_on_host(host, auth, keywords_lower, include_unknown=True, st
                     continue
                 visited.add(key)
 
-                # Build pattern and normalized current dir
                 if cur in ('\\', ''):
                     pattern = '\\*'
                     current_dir = '\\'
@@ -752,12 +702,9 @@ def enumerate_files_on_host(host, auth, keywords_lower, include_unknown=True, st
                     pattern = p + '\\*'
                     current_dir = '\\' + p if not p.startswith('\\') else p
 
-                # Status: current folder UNC
                 if status_cb:
-                    try:
-                        status_cb(host, share, current_dir)
-                    except Exception:
-                        pass
+                    try: status_cb(host, share, current_dir)
+                    except Exception: pass
 
                 try:
                     entries = conn.listPath(share, pattern)
@@ -765,7 +712,6 @@ def enumerate_files_on_host(host, auth, keywords_lower, include_unknown=True, st
                     continue
 
                 for e in entries:
-                    # Obtain name robustly
                     fname = None
                     for getter in ('get_longname', 'getFileName', 'get_shortname'):
                         try:
@@ -777,30 +723,24 @@ def enumerate_files_on_host(host, auth, keywords_lower, include_unknown=True, st
                     if not fname or fname in ('.', '..'):
                         continue
 
-                    # Full path within the share
                     if current_dir in ('\\', ''):
                         full = '\\' + fname
                     else:
                         full = current_dir.rstrip('\\') + '\\' + fname
 
-                    # Status: each entry touched
                     if status_cb:
-                        try:
-                            status_cb(host, share, full)
-                        except Exception:
-                            pass
+                        try: status_cb(host, share, full)
+                        except Exception: pass
 
-                    # Directory?
                     if _is_dir_entry(e):
                         max_depth = auth.get('max_dir_depth', MAX_DIR_DEPTH)
                         if max_depth is not None:
-                            depth = full.count('\\') - 1  # root '\' -> 0
+                            depth = full.count('\\') - 1
                             if depth > max_depth:
                                 continue
                         stack.append(full)
                         continue
 
-                    # File filter
                     name_l = fname.lower()
                     ext = os.path.splitext(name_l)[1]
                     interesting_name = any(kw in name_l for kw in ["pass", "pwd", "secret", "cred", "token", "key"])
@@ -811,43 +751,53 @@ def enumerate_files_on_host(host, auth, keywords_lower, include_unknown=True, st
                             cap = auth.get('max_unknown_bytes', MAX_UNKNOWN_BYTES)
                             tasks.append((host, share, full + f"|unknown<{cap}>"))
     finally:
-        try:
-            conn.logoff()
-        except Exception:
-            pass
-        try:
-            conn.close()
-        except Exception:
-            pass
+        try: conn.logoff()
+        except Exception: pass
+        try: conn.close()
+        except Exception: pass
 
     return tasks
 
-# ---------- File processing ----------
-def process_file_task_reconnect(task, auth, keywords_lower, status_cb=None):
-    """Reconnect for each file, download (capped), extract text, and scan for matches."""
-    host, share, filepath = task
-    if status_cb:
-        try:
-            status_cb(host, share, filepath if "|unknown<" not in filepath else filepath.split("|unknown<",1)[0])
-        except Exception:
-            pass
-
+# ---------- Download (I/O) and Parse (CPU) split ----------
+def _normalize_limit_and_path(filepath: str, auth):
     limit = auth.get('max_file_bytes', MAX_FILE_BYTES)
+    real_path = filepath
     if "|unknown<" in filepath:
         path_only, marker = filepath.split("|unknown<", 1)
-        filepath = path_only
+        real_path = path_only
         try:
             limit = min(limit, int(marker.rstrip(">").strip()))
         except Exception:
             limit = min(limit, auth.get('max_unknown_bytes', MAX_UNKNOWN_BYTES))
+    return real_path, limit
+
+def download_file_task(task, auth, status_cb=None):
+    """
+    Threaded I/O stage: download bytes from SMB.
+    Returns (host, share, path, ext, bytes) or None on failure.
+    """
+    host, share, filepath = task
+    real_path, limit = _normalize_limit_and_path(filepath, auth)
+
+    if status_cb:
+        try: status_cb(host, share, real_path)
+        except Exception: pass
+
+    b = download_file_smb_by_conn(host, auth, share, real_path, max_bytes=limit)
+    if not b:
+        return None
+    ext = file_ext(real_path)
+    return (host, share, real_path, ext, b)
+
+def parse_bytes_for_file(item, keywords_lower):
+    """
+    CPU-bound stage (runs in a separate process):
+    item = (host, share, path, ext, bytes) -> returns result dict or None.
+    """
+    host, share, filepath, ext, b = item
+    matches = []
 
     try:
-        b = download_file_smb_by_conn(host, auth, share, filepath, max_bytes=limit)
-        if not b:
-            return None
-        ext = file_ext(filepath)
-
-        matches = []
         if ext in EXTS_OFFICE_XML:
             text = extract_text_from_office_xml(b)
             if text:
@@ -858,7 +808,6 @@ def process_file_task_reconnect(task, auth, keywords_lower, status_cb=None):
             text = extract_text_from_pdf(b)
             if text:
                 matches.extend(scan_text_for_keywords(text, keywords_lower))
-            # Always also scan bytes for PDFs to catch additional patterns
             matches.extend(scan_bytes_for_patterns(b, keywords_lower))
 
         elif ext in EXTS_EMAIL:
@@ -883,15 +832,15 @@ def process_file_task_reconnect(task, auth, keywords_lower, status_cb=None):
 
         else:
             matches.extend(scan_bytes_for_patterns(b, keywords_lower))
-
-        if matches:
-            seen = set(); uniq = []
-            for m in matches:
-                if m not in seen:
-                    seen.add(m); uniq.append(m)
-            return {"host": host, "share": share, "path": filepath, "matches": uniq}
     except Exception:
         return None
+
+    if matches:
+        seen = set(); uniq = []
+        for m in matches:
+            if m not in seen:
+                seen.add(m); uniq.append(m)
+        return {"host": host, "share": share, "path": filepath, "matches": uniq}
     return None
 
 # ---------- Pretty table rendering (ANSI-aware) ----------
@@ -995,10 +944,6 @@ def render_table(rows, headers):
     return "\n".join(out)
 
 def format_screen_rows(found):
-    """
-    Show ALL matches per file, one row per match,
-    so large PDFs with many hits are fully represented.
-    """
     rows = []
     for item in found:
         host = item['host']; share = item['share']; path = item['path']
@@ -1010,9 +955,6 @@ def format_screen_rows(found):
     return rows
 
 def format_plain_rows(found):
-    """
-    Plain (no ANSI) version with ALL matches per file, one row per match.
-    """
     rows = []
     for item in found:
         host = item['host']; share = item['share']; path = item['path']
@@ -1055,7 +997,8 @@ def build_arg_parser():
     # Behavior/limits
     g_cfg = p.add_argument_group("Performance & Limits")
     g_cfg.add_argument("--threads-enum", type=int, help=f"Enumeration workers (default {THREADS_ENUM})")
-    g_cfg.add_argument("--threads-files", type=int, help=f"Download/scan workers (default {THREADS_FILES})")
+    g_cfg.add_argument("--threads-files", type=int, help=f"Download workers (default {THREADS_FILES})")
+    g_cfg.add_argument("--procs", type=int, help=f"CPU parsing workers (default {PROCS_PARSE})")
     g_cfg.add_argument("--max-file-bytes", type=int, help=f"Max bytes per file (default {MAX_FILE_BYTES})")
     g_cfg.add_argument("--max-unknown-bytes", type=int, help=f"Max bytes for unknown files (default {MAX_UNKNOWN_BYTES})")
     g_cfg.add_argument("--max-dir-depth", type=int, help=f"Max directory depth (default {MAX_DIR_DEPTH})")
@@ -1156,13 +1099,13 @@ def main():
             if not keywords_lower:
                 keywords_lower = [k.lower() for k in KEYWORDS_DEFAULT]
 
-    # Threads
+    # Concurrency settings
     enum_threads = args.threads_enum or THREADS_ENUM
-    file_threads = args.threads_files or THREADS_FILES
+    file_threads = args.threads_files or THREADS_FILES         # download threads
+    procs_parse  = args.procs or PROCS_PARSE                   # CPU parsing procs
 
     # ---- Collect auth details per mode ----
     if auth['mode'] == 'kerberos':
-        # Domain required
         if not auth['domain']:
             interactive = True
             while True:
@@ -1175,7 +1118,6 @@ def main():
             interactive = True
             auth['username'] = input("Username (user only, not DOMAIN\\user): ").strip()
 
-        # Cache or secret?
         if not auth['password'] and not auth['use_cache'] and not args.password and not args.hash:
             interactive = True
             use_cache = input("Use Kerberos credential cache (kinit)? [y/N]: ").strip().lower() in ("y", "yes")
@@ -1213,7 +1155,6 @@ def main():
             tn = input("Target SPN name (hostname/FQDN used for SPN cifs/<name>) [usually the Domaincontroller's FQDN]: ").strip()
             auth['target_name'] = tn or None
 
-        # Kerberos sanity test
         test_host = first_network_host_str(network)
         if test_host:
             ok, reason = test_kerberos(auth, test_host)
@@ -1244,7 +1185,6 @@ def main():
             print(f"{C.WARNING}No usable host in the provided CIDR to test Kerberos; continuing without pre-test.{C.END}")
 
     else:
-        # NTLM mode
         if not auth['username']:
             interactive = True
             auth['username'] = input("Username (DOMAIN\\user or user): ").strip()
@@ -1279,7 +1219,7 @@ def main():
 
     print(f"Enumerating shares and candidate files on {len(hosts)} hosts (enum threads={enum_threads})...")
 
-    # Stage 1: enumerate files per host (with live status below bar)
+    # Stage 1: enumerate files per host (threaded + live status)
     file_tasks = []
     enum_workers = min(enum_threads, max(4, len(hosts)))
     auth_for_enum = auth.copy()
@@ -1296,32 +1236,52 @@ def main():
                     file_tasks.extend(tasks)
             except Exception:
                 continue
-        # Clear the extra status line after this bar completes
         clear_status_line()
 
     if not file_tasks:
         print("No candidate files found (no shares with supported/selected file types). Exiting.")
         return
 
-    print(f"Found {len(file_tasks)} candidate files. Scanning files for secrets (file threads={file_threads})...")
+    print(f"Found {len(file_tasks)} candidate files.")
+    print(f"Downloading with {file_threads} threads; parsing with {procs_parse} processes...")
 
-    # Stage 2: scan files (with live status below bar)
+    # Stage 2: I/O download (threads) -> CPU parsing (processes)
     found = []
     auth_for_files = auth.copy()
     scan_status_cb = make_scan_status_cb()
 
-    with ThreadPoolExecutor(max_workers=file_threads) as ex:
-        futures = {ex.submit(process_file_task_reconnect, task, auth_for_files, keywords_lower, scan_status_cb): task
-                   for task in file_tasks}
-        pbar2 = tqdm(as_completed(futures), total=len(futures), desc="Scanning files", unit="file")
-        for fut in pbar2:
+    # 2a) Download stage (threads)
+    parse_futures = []
+    with ThreadPoolExecutor(max_workers=file_threads) as ex_dl, \
+         ProcessPoolExecutor(max_workers=procs_parse) as ex_cpu:
+
+        # Submit all downloads
+        dl_futures = {ex_dl.submit(download_file_task, task, auth_for_files, scan_status_cb): task
+                      for task in file_tasks}
+
+        # As each download finishes, submit CPU parse job
+        pbar_dl = tqdm(as_completed(dl_futures), total=len(dl_futures), desc="Downloading files", unit="file")
+        for f in pbar_dl:
+            item = None
             try:
-                res = fut.result()
+                item = f.result()
+            except Exception:
+                item = None
+            if item:
+                # Submit CPU-bound parse to process pool
+                pf = ex_cpu.submit(parse_bytes_for_file, item, keywords_lower)
+                parse_futures.append(pf)
+        clear_status_line()
+
+        # 2b) Parse stage (processes)
+        pbar_cpu = tqdm(as_completed(parse_futures), total=len(parse_futures), desc="Parsing & scanning", unit="file")
+        for pf in pbar_cpu:
+            try:
+                res = pf.result()
                 if res:
                     found.append(res)
             except Exception:
                 continue
-        clear_status_line()
 
     # Output
     print_results_table(found)
