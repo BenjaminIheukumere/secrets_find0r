@@ -141,7 +141,7 @@ BANNER = r"""
                                                                            
 """
 imprint = r"""
-                  Secrets Find0r v1.4
+                  Secrets Find0r v1.6
            by Benjamin Iheukumere | SafeLink IT
                b.iheukumere@safelink-it.com
 """
