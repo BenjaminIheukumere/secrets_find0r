@@ -1041,7 +1041,7 @@ def build_arg_parser():
     g_scan.add_argument("--keywords", help="Comma-separated custom keywords (overrides default keywords)")
 
     # Optional stdout live
-    p.add_argument("--stdout", action="store_true", help="Live-Findings zusätzlich auf stdout ausgeben (Standard: nein)")
+    p.add_argument("--stdout", action="store_true", help="Print Live-Findings via stdout on screen (Standard: no)")
 
     return p
 
