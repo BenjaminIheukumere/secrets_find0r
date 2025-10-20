@@ -1302,7 +1302,7 @@ def main():
                 res = fut.result()
                 if res:
                     found_count += 1
-                    append_findings(res, also_stdout=stdout_live)  # Sofort in Datei + optional stdout
+                    append_findings(res, also_stdout=stdout_live)  # Write to file directly + optional stdout
             except Exception:
                 continue
         clear_status_line()
@@ -1311,7 +1311,7 @@ def main():
     print(f"\nScan abgeschlossen. Treffer-Datei: {output_file}", flush=True)
     print(f"Anzahl Dateien mit Treffern: {found_count}", flush=True)
     if stdout_live is False:
-        print("(Hinweis: Live-stdout war deaktiviert. Verwenden Sie --stdout oder bestätigen Sie die Nachfrage, um Live-Ausgaben zu sehen.)", flush=True)
+        print("(Note: Live-stdout was deactivated. Use --stdout or confirm during prompt for live findings via stdout.)", flush=True)
 
     # Abschlusszeile
     with _OUT_LOCK:
