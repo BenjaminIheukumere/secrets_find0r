@@ -1246,13 +1246,14 @@ def main():
     stdout_live = bool(args.stdout)
     if not args.stdout:
         interactive = True
-        ans = input("Findings zusätzlich live auf dem Bildschirm ausgeben? [n/N = nein, y/Y = ja]: ").strip().lower()
+        ans = input("Show interactive logs? [n/N = nein, y/Y = ja]: ").strip().lower()
         stdout_live = ans in ("y", "yes", "j", "ja")
 
     # Hosts & output
     hosts = [str(h) for h in network.hosts()]
     prefix = (auth.get('domain') + '_' if auth.get('domain') else '') + (auth.get('username') or 'anon')
-    output_file = f"{prefix}_secrets_found_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    filename_cidr = args.cidr.replace(".","_").replace("/","_")
+    output_file = f"{prefix}_secrets_found_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{filename_cidr}.txt"
     open_output_file(output_file)  # Datei direkt öffnen (Append + Header)
     print(f"Output-Datei (TSV, Append): {output_file}", flush=True)
 
